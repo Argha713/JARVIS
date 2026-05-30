@@ -139,6 +139,7 @@ async def main():
                     t_start = time.perf_counter()
                     response = await router.handle(text)
                     logger.info(f"[CYCLE] Total processing: {time.perf_counter() - t_start:.1f}s")
+                    narration.flush()   # discard stale "Using X..." before speaking answer
                     await tts.speak(response)
                     # Stay in conversation mode for follow-up questions
                 else:

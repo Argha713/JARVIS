@@ -113,6 +113,11 @@ def call_page(site_id: str, page_name: str, query: str) -> dict | None:
                 else:
                     logger.info("[API_CLIENT] Success — data type: {}", type(data).__name__)
 
+                # Full response dump so we can evaluate what each endpoint actually returns
+                raw_json = json.dumps(data, indent=2, default=str)
+                logger.debug("[API_CLIENT] Full response ({} bytes):\n{}", len(raw_json),
+                             raw_json[:4000] + (" ... [truncated]" if len(raw_json) > 4000 else ""))
+
                 store.touch_endpoint(ep["id"])
                 return data
 
@@ -153,20 +158,50 @@ def _log_data_preview(data: dict) -> None:
             logger.debug("[API_CLIENT]   {} = {!r}", k, v)
 
 
-def format_answer(query: str, data: dict) -> str:
+def format_answer(query: str, data: dict, config: dict | None = None) -> str:
     """
-    Ask the local Ollama LLM to format a natural-language answer from raw API JSON.
-    Falls back to a plain key-value listing if Ollama is unreachable.
+    Ask the LLM to format a natural-language answer from raw API JSON.
+    Uses OpenAI if configured (same provider as the rest of JARVIS), falls back
+    to Ollama, then to a plain key-value listing if both are unreachable.
     """
     logger.info("[API_CLIENT] Formatting answer via LLM | data keys: {}", list(data.keys()))
 
     prompt = (
         f"The user asked: \"{query}\"\n\n"
-        f"The portal returned this data:\n{json.dumps(data, indent=2)}\n\n"
+        f"The portal returned this data:\n{json.dumps(data, indent=2, default=str)}\n\n"
         "Answer the user's question in one or two clear spoken sentences. "
         "Use the exact values from the data. No markdown, no bullet points. "
         "Speak as if answering aloud to your boss."
     )
+
+    # Try OpenAI first (already connected, higher quality)
+    openai_key = (config or {}).get("llm", {}).get("openai_api_key", "")
+    if not openai_key:
+        # Load from config.json directly if not passed in
+        try:
+            import json as _j
+            from pathlib import Path
+            _cfg = _j.loads(Path("config.json").read_text(encoding="utf-8"))
+            openai_key = _cfg.get("llm", {}).get("openai_api_key", "")
+        except Exception:
+            pass
+
+    if openai_key:
+        try:
+            import openai as _openai
+            client = _openai.OpenAI(api_key=openai_key)
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=120,
+            )
+            answer = response.choices[0].message.content.strip()
+            logger.info("[API_CLIENT] LLM answer (openai): {!r}", answer[:120])
+            return answer
+        except Exception as e:
+            logger.warning("[API_CLIENT] OpenAI format failed: {} — trying Ollama", e)
+
+    # Fallback: Ollama
     try:
         import ollama
         client = ollama.Client(host="http://localhost:11434")
@@ -176,9 +211,11 @@ def format_answer(query: str, data: dict) -> str:
             options={"num_predict": 120},
         )
         answer = response["message"]["content"].strip()
-        logger.info("[API_CLIENT] LLM answer: {!r}", answer[:120])
+        logger.info("[API_CLIENT] LLM answer (ollama): {!r}", answer[:120])
         return answer
     except Exception as e:
-        logger.warning("[API_CLIENT] LLM format failed: {} — using plain fallback", e)
-        lines = [f"{k}: {v}" for k, v in data.items() if not isinstance(v, (dict, list))]
-        return ". ".join(lines) if lines else str(data)
+        logger.warning("[API_CLIENT] Ollama format failed: {} — using plain fallback", e)
+
+    # Last resort: flat key-value dump (no nested objects)
+    lines = [f"{k}: {v}" for k, v in data.items() if not isinstance(v, (dict, list))]
+    return ". ".join(lines) if lines else str(data)

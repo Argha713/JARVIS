@@ -173,7 +173,7 @@ class TaskRouter:
         t_route = time.perf_counter()
         decision = self._pre_route(user_input)
         if decision is None:
-            decision = await self.llm.route(user_input)
+            decision = await self.llm.route(user_input, history=self._history)
         logger.info(f"[ROUTER] Route took {time.perf_counter() - t_route:.1f}s → {decision}")
 
         tool_name = decision.get("tool", "answer")

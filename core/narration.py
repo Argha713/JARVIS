@@ -41,6 +41,23 @@ class Narration:
     def step(self, action: str) -> None:
         self.say(action)
 
+    def flush(self) -> None:
+        """
+        Discard all pending queued narration items.
+        Call this just before speaking the final answer so stale progress messages
+        (e.g. 'Searching the web...') don't play out after the answer has been given.
+        """
+        count = 0
+        while not self.queue.empty():
+            try:
+                self.queue.get_nowait()
+                self.queue.task_done()
+                count += 1
+            except Exception:
+                break
+        if count:
+            logger.debug("[NARRATION] Flushed {} stale item(s)", count)
+
     async def worker(self) -> None:
         """Long-running coroutine. Drains queue and speaks each message in order."""
         while True:

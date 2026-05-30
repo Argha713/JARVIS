@@ -304,6 +304,17 @@ class Transcriber:
 
         # Write float32 audio to a temp WAV file — OpenAI API requires a file object
         pcm = (audio * 32767).astype(np.int16)
+
+        # Guard: OpenAI Whisper hallucinates on silence/ambient noise.
+        # Compute RMS on the int16 PCM. Normal speech is 2000–15000; ambient
+        # noise / near-silence that sneaked past the recording threshold is
+        # typically < 300. Skip the API call entirely if energy is too low.
+        rms = float(np.sqrt(np.mean(pcm.astype(np.float32) ** 2)))
+        logger.debug("[STT] Audio RMS: {:.0f} (threshold=300)", rms)
+        if rms < 300:
+            logger.debug("[STT] Audio too quiet — skipping Whisper call (rms={:.0f})", rms)
+            return ""
+
         tmp_path = None
         try:
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:

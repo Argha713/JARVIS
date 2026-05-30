@@ -148,17 +148,23 @@ class LLMEngine:
             logger.warning(f"[CLASSIFY] Error: {e} — defaulting to SIMPLE")
             return "SIMPLE"
 
-    async def route(self, text: str) -> dict:
+    async def route(self, text: str, history: list = None) -> dict:
         logger.info(f"[ROUTE] Input: {text!r}")
         t0 = time.perf_counter()
+
+        # Include the last 2 conversation turns so the router can resolve
+        # follow-ups like "What about in Kolkata?" using context ("weather" from
+        # the previous exchange) without misrouting to file_ops or news.
+        messages = [{"role": "system", "content": ROUTE_PROMPT}]
+        if history:
+            for msg in history[-4:]:   # last 4 entries = 2 turns (user + assistant each)
+                messages.append({"role": msg["role"], "content": msg["content"]})
+        messages.append({"role": "user", "content": text})
 
         try:
             raw = await self._chat(
                 self.fast_model,
-                [
-                    {"role": "system", "content": ROUTE_PROMPT},
-                    {"role": "user",   "content": text},
-                ],
+                messages,
                 num_predict=100,
             )
         except Exception as e:
