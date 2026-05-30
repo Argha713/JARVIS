@@ -12,10 +12,12 @@ Background enrichment (after answer is spoken):
   - Extracts sections from each tab
   - No user interaction
 """
+import json as _json
 import re
 import threading
 import time
 from datetime import datetime, timedelta
+from urllib.parse import urlparse, urlunparse
 
 from loguru import logger
 from playwright.sync_api import Page, sync_playwright
@@ -70,11 +72,23 @@ def discover(query: str, site_id: str, narration,
 
     current_url = None
     answer = None
+    _first_visit = not store.site_has_sections(site_id)
     pw = sync_playwright().start()
     try:
-        browser = pw.chromium.launch(headless=False, slow_mo=80)
+        browser = pw.chromium.launch(headless=not _first_visit, slow_mo=80 if _first_visit else 0)
         context = browser.new_context(**ctx_kwargs)
         page    = context.new_page()
+
+        # Intercept all JSON responses — captures API endpoints for future direct calls
+        _captured_api: dict = {}
+        def _on_response(response):
+            try:
+                ct = response.headers.get("content-type", "")
+                if "json" in ct and response.status == 200:
+                    _captured_api[response.url] = response.json()
+            except Exception:
+                pass
+        page.on("response", _on_response)
 
         try:
             page.goto(start_url, timeout=35_000, wait_until="domcontentloaded")
@@ -107,10 +121,12 @@ def discover(query: str, site_id: str, narration,
         # Extract full page
         current_url = page.url
         page_id = store.upsert_page(site_id, current_url)
+        _save_captured_endpoints(site_id, current_url, _captured_api)
         sections = extract_page(page, site_id, page_id, current_url)
 
         if sections:
-            narration.say("I'm learning this page in the background.")
+            if _first_visit:
+                narration.say("I'm learning this page in the background.")
             # Cache all extracted values
             for sec in sections:
                 from tools.web_engine import store as s
@@ -118,10 +134,22 @@ def discover(query: str, site_id: str, narration,
                 s.set_cache(sect_id, sec["value"])
 
             # Find best matching section
-            hits = store.semantic_search(query, site_id=site_id, n=1)
+            hits = store.semantic_search(query, site_id=site_id, n=3)
             if hits:
-                answer = hits[0]["document"]
-                logger.info("[DISCOVERER] Answer found: {!r}", answer[:80])
+                logger.debug("[DISCOVERER] Post-extraction search hits:")
+                for i, h in enumerate(hits):
+                    logger.debug("[DISCOVERER]   #{} score={:.3f} label={!r} sid={}",
+                                 i + 1, h["score"], h["label"][:50], h["section_id"][:8])
+                best = hits[0]
+                raw = store.get_cache(best["section_id"])
+                logger.debug("[DISCOVERER] Selected {} label={!r} cache={}",
+                             best["section_id"][:8], best["label"],
+                             repr(raw[:40]) if raw else "MISS")
+                if raw:
+                    answer = store.format_with_history(best["section_id"], raw)
+                else:
+                    answer = best["document"]
+                logger.info("[DISCOVERER] Answer → {!r}", answer[:120])
         else:
             logger.warning("[DISCOVERER] No sections extracted from {!r}", current_url)
 
@@ -530,6 +558,45 @@ def _find_known_page_url(query: str, site_id: str) -> str | None:
     except Exception as e:
         logger.debug("[DISCOVERER] Known page lookup failed: {}", e)
     return None
+
+
+def _url_to_page_name(url: str) -> str | None:
+    """Map a portal page URL to a logical page name used for API endpoint storage."""
+    if "/my-activity" in url:
+        return "activity"
+    if "/leave" in url:
+        return "leave"
+    if "/requests" in url:
+        return "requests"
+    if "/work-journal" in url:
+        return "work_journal"
+    return None
+
+
+# Endpoints under these paths are auth/infra — not data APIs worth saving
+_SKIP_API_PATHS = ("/auth/", "/login/", "/token", "/refresh", "/logout",
+                   "/healthz", "/metrics", "/static/", "/favicon")
+
+
+def _save_captured_endpoints(site_id: str, page_url: str, captured: dict) -> None:
+    """Persist intercepted JSON API calls to the api_endpoints table."""
+    page_name = _url_to_page_name(page_url)
+    if not page_name or not captured:
+        return
+    saved = 0
+    for raw_url, data in captured.items():
+        if not isinstance(data, dict) or len(data) < 2:
+            continue
+        if any(skip in raw_url for skip in _SKIP_API_PATHS):
+            continue
+        # Strip query params — month/page params are injected dynamically at call time
+        parsed = urlparse(raw_url)
+        clean_url = urlunparse(parsed._replace(query="", fragment=""))
+        store.save_api_endpoint(site_id, page_name, clean_url, "GET",
+                                _json.dumps(data))
+        saved += 1
+    if saved:
+        logger.info("[DISCOVERER] Saved {} API endpoint(s) for page={!r}", saved, page_name)
 
 
 def _start_background_enrichment(site_id: str, page_id: str,

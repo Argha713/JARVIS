@@ -39,10 +39,31 @@ _JS = """
 
     // ── Strategy 1: Ant Design statistic cards ─────────────────────────────
     document.querySelectorAll('.ant-statistic').forEach(stat => {
-        const titleEl = stat.querySelector('.ant-statistic-title');
         const valueEl = stat.querySelector('.ant-statistic-content');
-        if (titleEl && valueEl) {
-            add(titleEl.innerText, valueEl.innerText, stat);
+        if (!valueEl) return;
+        const value = clean(valueEl.innerText);
+        if (!value || !/\\d/.test(value)) return;
+
+        const titleEl = stat.querySelector('.ant-statistic-title');
+        if (titleEl) {
+            // Standard: title lives inside .ant-statistic
+            add(clean(titleEl.innerText), value, stat);
+        } else {
+            // Portal variant: label lives in a sibling element of .ant-statistic
+            // (e.g. <div class="ant-space"><span class="ant-typography">Punctuality Rate</span></div>)
+            const parent = stat.parentElement;
+            if (!parent) return;
+            const siblings = Array.from(parent.querySelectorAll('.ant-typography, span[style]'));
+            // Pick the first sibling that is NOT a descendant of stat and looks like a label
+            const labelEl = siblings.find(el =>
+                !stat.contains(el) &&
+                clean(el.innerText).length > 1 &&
+                !/^[\\d\\s%./:-]+$/.test(clean(el.innerText))
+            );
+            if (labelEl) {
+                const label = clean(labelEl.innerText);
+                if (label && label !== value) add(label, value, stat);
+            }
         }
     });
 
@@ -170,16 +191,39 @@ def extract_page(page: Page, site_id: str, page_id: str, url: str) -> list[dict]
 
     logger.info("[EXTRACTOR] {} sections found on: {}", len(sections), url)
 
+    # Log every extracted section so we can see exactly what was picked up
+    for i, item in enumerate(sections):
+        logger.debug(
+            "[EXTRACTOR] #{:02d} label={!r:<45} value={!r}",
+            i + 1, item["label"][:45], item["value"][:60]
+        )
+
     # Persist
+    new_labels: set[str] = set()
     for item in sections:
         label    = item["label"]
         value    = item["value"]
         selector = item.get("selector", "")
+        new_labels.add(label)
 
         section_id = store.upsert_section(page_id, label, selector)
         store.index_section(section_id, label, value, site_id, page_id, url)
+        logger.debug("[EXTRACTOR] Indexed  {} label={!r} value={!r}",
+                     section_id[:8], label[:40], value[:40])
 
-    logger.debug("[EXTRACTOR] Stored {} sections in DB + ChromaDB", len(sections))
+    # Remove stale ChromaDB entries for sections no longer found on this page.
+    # This prevents old value-embedded labels (e.g. "57.89 % Punctuality Rate") from
+    # persisting in the index after the extractor learns the clean label ("Punctuality Rate").
+    existing = store.get_sections_for_page(page_id)
+    stale_removed = 0
+    for sec in existing:
+        if sec["label"] not in new_labels:
+            store.delete_section_embedding(sec["id"])
+            stale_removed += 1
+            logger.debug("[EXTRACTOR] Purged stale ChromaDB entry: {!r}", sec["label"][:60])
+
+    logger.info("[EXTRACTOR] Done — {} indexed, {} stale purged from ChromaDB",
+                len(sections), stale_removed)
     return sections
 
 

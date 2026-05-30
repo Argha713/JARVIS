@@ -9,7 +9,7 @@ import threading
 
 from loguru import logger
 
-from tools.web_engine import store, resolver, retriever, discoverer, validator
+from tools.web_engine import store, resolver, retriever, discoverer, validator, api_client
 from tools.web_engine.actions import form_submit
 
 
@@ -64,18 +64,33 @@ class WebEngine:
         # ── Read intent ─────────────────────────────────────────────────────
         self.narration.step("Let me look that up...")
 
-        # Skip cache for time-specific queries (month navigation needed)
         from tools.web_engine.discoverer import _extract_month_target
         needs_fresh = _extract_month_target(query) is not None
 
+        # ── API-first path — direct httpx call, no browser ───────────────
+        page_name = _query_to_page_name(site_id, query)
+        if page_name:
+            try:
+                api_data = api_client.call_page(site_id, page_name, query)
+                if api_data:
+                    answer = api_client.format_answer(query, api_data)
+                    if answer:
+                        logger.info("[ENGINE] API-first answer for page={!r}", page_name)
+                        return answer
+            except api_client.AuthExpired:
+                logger.info("[ENGINE] API auth expired — falling through to discoverer for re-login")
+                self.narration.step("The portal session has expired — let me refresh it.")
+
+        # ── ChromaDB cache — skip for time-specific queries ───────────────
         if not needs_fresh:
             answer = retriever.retrieve(query, site_id)
             if answer:
                 return answer
 
-        # Unknown or time-specific — discover
+        # ── Discovery — Playwright (first visit, cache miss, auth refresh) ─
         logger.info("[ENGINE] Discovering for query: {!r}", query)
-        self.narration.step("I haven't seen this before — let me find it.")
+        if not store.site_has_sections(site_id):
+            self.narration.step("I haven't seen this before — let me find it.")
         # For temporal follow-ups (needs_fresh), pass the last known page URL so
         # the discoverer starts directly on /my-activity (or /leave etc.) rather
         # than from the portal home page and failing to navigate there.
@@ -153,6 +168,23 @@ class WebEngine:
         if site:
             self.narration.step(f"Opening {site['name'] or site_id} for you...")
         return f"Please complete this action in the browser that's opening now."
+
+
+def _query_to_page_name(site_id: str, query: str) -> str | None:
+    """Map a query to the portal page_name used for API endpoint lookup."""
+    if site_id != _PORTAL_SITE_ID:
+        return None
+    q = query.lower()
+    if any(w in q for w in ("attendance", "punctuality", "activity", "check in",
+                             "check out", "active hours", "working hours",
+                             "punctual", "hours worked")):
+        return "activity"
+    if any(w in q for w in ("leave", "casual leave", "sick leave", "leave balance",
+                             "leaves remaining", "leaves left")):
+        return "leave"
+    if any(w in q for w in ("request", "ticket", "support ticket", "support request")):
+        return "requests"
+    return None
 
 
 # ──────────────────────────────────────────────────────────────────────────────

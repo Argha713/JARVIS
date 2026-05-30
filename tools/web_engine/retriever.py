@@ -23,29 +23,34 @@ def retrieve(query: str, site_id: str) -> str | None:
     """
     Returns the answer string, or None if the data isn't known yet.
     """
+    logger.info("[RETRIEVER] ── retrieve query={!r}", query[:80])
     hits = store.semantic_search(query, site_id=site_id, n=5)
     if not hits:
-        logger.debug("[RETRIEVER] No ChromaDB hits for {!r}", query[:60])
+        logger.info("[RETRIEVER] No ChromaDB hits — sending to discoverer")
         return None
 
+    logger.debug("[RETRIEVER] Semantic search returned {} hit(s):", len(hits))
+    for i, h in enumerate(hits):
+        logger.debug("[RETRIEVER]   #{} score={:.3f} label={!r} url={!r}",
+                     i + 1, h["score"], h["label"][:50], h["url"])
+
     best = hits[0]
-    logger.debug("[RETRIEVER] Best hit: label={!r} score={:.2f} url={!r}",
-                 best["label"], best["score"], best["url"])
+    logger.info("[RETRIEVER] Best: label={!r} score={:.3f} (threshold={})",
+                best["label"], best["score"], _MATCH_THRESHOLD)
 
     if best["score"] < _MATCH_THRESHOLD:
-        logger.debug("[RETRIEVER] Score {:.2f} below threshold — handing to discoverer",
-                     best["score"])
+        logger.info("[RETRIEVER] Score below threshold → discoverer")
         return None
 
     section_id = best["section_id"]
     cached = store.get_cache(section_id)
     if cached:
-        logger.info("[RETRIEVER] Cache hit for {!r} → {!r}", best["label"], cached[:60])
-        return cached
+        logger.info("[RETRIEVER] Cache HIT  {} label={!r} value={!r}",
+                    section_id[:8], best["label"], cached[:60])
+        return store.format_with_history(section_id, cached)
 
-    # Cache stale — re-fetch
-    logger.info("[RETRIEVER] Cache stale for {!r} — re-fetching from {!r}",
-                best["label"], best["url"])
+    logger.info("[RETRIEVER] Cache MISS {} label={!r} — re-fetching from {!r}",
+                section_id[:8], best["label"], best["url"])
     return _refresh(site_id, best)
 
 
@@ -78,8 +83,10 @@ def _refresh(site_id: str, hit: dict) -> str | None:
 
         if value:
             store.set_cache(hit["section_id"], value)
-            logger.info("[RETRIEVER] Refreshed {!r} → {!r}", label, value[:60])
-        return value
+            logger.info("[RETRIEVER] Refresh OK {!r} → {!r}", label, value[:60])
+            return store.format_with_history(hit["section_id"], value)
+        logger.warning("[RETRIEVER] Refresh FAILED for {!r} — returning None", label)
+        return None
 
     finally:
         navigate.close_page(pw, browser)

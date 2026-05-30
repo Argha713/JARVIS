@@ -105,6 +105,27 @@ def init_db() -> None:
             created_at TEXT DEFAULT (datetime('now')),
             status     TEXT DEFAULT 'pending'
         );
+
+        CREATE TABLE IF NOT EXISTS section_history (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            section_id  TEXT NOT NULL,
+            data        TEXT NOT NULL,
+            recorded_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_section_history
+            ON section_history(section_id, recorded_at);
+
+        CREATE TABLE IF NOT EXISTS api_endpoints (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            site_id         TEXT    NOT NULL,
+            page_name       TEXT    NOT NULL,
+            url             TEXT    NOT NULL,
+            method          TEXT    NOT NULL DEFAULT 'GET',
+            sample_response TEXT,
+            discovered_at   TEXT    NOT NULL,
+            last_used_at    TEXT,
+            UNIQUE(site_id, page_name, url)
+        );
         """)
     logger.debug("[STORE] DB initialised at {}", _DB_PATH)
 
@@ -127,6 +148,19 @@ def upsert_site(site_id: str, base_url: str, name: str = "") -> None:
 def get_site(site_id: str) -> Optional[sqlite3.Row]:
     with _db() as con:
         return con.execute("SELECT * FROM sites WHERE id=?", (site_id,)).fetchone()
+
+
+def site_has_sections(site_id: str) -> bool:
+    """Return True if this site has ever had sections indexed (i.e. been visited before)."""
+    con = _conn()
+    try:
+        row = con.execute(
+            "SELECT 1 FROM sections s JOIN pages p ON s.page_id = p.id WHERE p.site_id = ? LIMIT 1",
+            (site_id,)
+        ).fetchone()
+        return row is not None
+    finally:
+        con.close()
 
 
 def save_session(site_id: str, session_data: dict) -> None:
@@ -301,6 +335,8 @@ def set_cache(section_id: str, data: str) -> None:
                 extracted_at=excluded.extracted_at,
                 expires_at=excluded.expires_at
         """, (section_id, data, now, expires))
+    logger.debug("[STORE] set_cache {} value={!r}", section_id[:8], data[:60])
+    _record_history(section_id, data)
 
 
 def get_cache(section_id: str) -> Optional[str]:
@@ -310,10 +346,12 @@ def get_cache(section_id: str) -> Optional[str]:
             (section_id,)
         ).fetchone()
     if not row:
+        logger.debug("[STORE] get_cache {} → MISS (no row)", section_id[:8])
         return None
     if datetime.fromisoformat(row["expires_at"]) < datetime.now(timezone.utc):
-        logger.debug("[STORE] Cache expired for section {}", section_id)
+        logger.debug("[STORE] get_cache {} → EXPIRED", section_id[:8])
         return None
+    logger.debug("[STORE] get_cache {} → HIT value={!r}", section_id[:8], row["data"][:60])
     return row["data"]
 
 
@@ -376,6 +414,45 @@ def get_all_actions_for_site(site_id: str) -> list[dict]:
 
 
 # ─────────────────────────────────────────────
+# API endpoints
+# ─────────────────────────────────────────────
+
+def save_api_endpoint(site_id: str, page_name: str, url: str,
+                      method: str, sample_response: str) -> None:
+    with _db() as con:
+        con.execute(
+            """INSERT INTO api_endpoints
+               (site_id, page_name, url, method, sample_response, discovered_at)
+               VALUES (?,?,?,?,?,?)
+               ON CONFLICT(site_id, page_name, url) DO UPDATE SET
+                   sample_response = excluded.sample_response,
+                   discovered_at   = excluded.discovered_at""",
+            (site_id, page_name, url, method, sample_response, _now())
+        )
+    logger.debug("[STORE] API endpoint saved: {} {} (page={})", method, url, page_name)
+
+
+def get_api_endpoints(site_id: str, page_name: str) -> list[dict]:
+    with _db() as con:
+        rows = con.execute(
+            """SELECT id, url, method, sample_response FROM api_endpoints
+               WHERE site_id=? AND page_name=?
+               ORDER BY COALESCE(last_used_at, discovered_at) DESC""",
+            (site_id, page_name)
+        ).fetchall()
+    return [{"id": r["id"], "url": r["url"], "method": r["method"],
+             "sample": r["sample_response"]} for r in rows]
+
+
+def touch_endpoint(endpoint_id: int) -> None:
+    with _db() as con:
+        con.execute(
+            "UPDATE api_endpoints SET last_used_at=? WHERE id=?",
+            (_now(), endpoint_id)
+        )
+
+
+# ─────────────────────────────────────────────
 # ChromaDB — section embeddings
 # ─────────────────────────────────────────────
 
@@ -400,6 +477,7 @@ def index_section(section_id: str, label: str, value: str,
             "label":      label,
         }]
     )
+    logger.debug("[STORE] index_section {} doc={!r}", section_id[:8], document[:70])
 
 
 def semantic_search(query: str, site_id: str = "", n: int = 5) -> list[dict]:
@@ -408,11 +486,15 @@ def semantic_search(query: str, site_id: str = "", n: int = 5) -> list[dict]:
     Optionally filtered to a specific site.
     """
     col = _chroma_collection()
-    if col.count() == 0:
+    total = col.count()
+    logger.debug("[STORE] semantic_search query={!r} site={!r} n={} total_indexed={}",
+                 query[:60], site_id, n, total)
+    if total == 0:
+        logger.debug("[STORE] semantic_search → ChromaDB empty")
         return []
 
     where = {"site_id": site_id} if site_id else None
-    kwargs = {"query_texts": [query], "n_results": min(n, col.count())}
+    kwargs = {"query_texts": [query], "n_results": min(n, total)}
     if where:
         kwargs["where"] = where
 
@@ -429,6 +511,7 @@ def semantic_search(query: str, site_id: str = "", n: int = 5) -> list[dict]:
     distances = results.get("distances", [[]])[0]
 
     for i, sid in enumerate(ids):
+        score = 1 - distances[i]
         hits.append({
             "section_id": sid,
             "page_id":    metas[i].get("page_id", ""),
@@ -436,8 +519,10 @@ def semantic_search(query: str, site_id: str = "", n: int = 5) -> list[dict]:
             "url":        metas[i].get("url", ""),
             "label":      metas[i].get("label", ""),
             "document":   docs[i],
-            "score":      1 - distances[i],   # cosine similarity (higher = better)
+            "score":      score,
         })
+        logger.debug("[STORE]   hit #{} score={:.3f} label={!r} doc={!r}",
+                     i + 1, score, metas[i].get("label", "")[:40], docs[i][:50])
     return hits
 
 
@@ -447,6 +532,84 @@ def delete_section_embedding(section_id: str) -> None:
         col.delete(ids=[section_id])
     except Exception:
         pass
+
+
+# ─────────────────────────────────────────────
+# Section history
+# ─────────────────────────────────────────────
+
+def _record_history(section_id: str, data: str) -> None:
+    """Record a new history entry only when the value actually changed. Keeps last 5."""
+    with _db() as con:
+        last = con.execute(
+            "SELECT data FROM section_history WHERE section_id=? ORDER BY recorded_at DESC LIMIT 1",
+            (section_id,)
+        ).fetchone()
+        if last and last["data"] == data:
+            logger.debug("[STORE] history {} → UNCHANGED (skip)", section_id[:8])
+            return  # value unchanged — skip
+        prev = last["data"] if last else None
+        con.execute(
+            "INSERT INTO section_history (section_id, data, recorded_at) VALUES (?, ?, ?)",
+            (section_id, data, _now())
+        )
+        # Prune: keep only the 5 most recent rows
+        con.execute("""
+            DELETE FROM section_history
+            WHERE section_id=? AND id NOT IN (
+                SELECT id FROM section_history
+                WHERE section_id=? ORDER BY recorded_at DESC LIMIT 5
+            )
+        """, (section_id, section_id))
+    if prev is None:
+        logger.debug("[STORE] history {} → FIRST ENTRY value={!r}", section_id[:8], data[:40])
+    else:
+        logger.debug("[STORE] history {} → CHANGED {!r} → {!r}",
+                     section_id[:8], prev[:40], data[:40])
+
+
+def get_history(section_id: str, n: int = 5) -> list[dict]:
+    """Returns up to n most-recent history rows: [{data, recorded_at}, ...]"""
+    with _db() as con:
+        rows = con.execute(
+            "SELECT data, recorded_at FROM section_history WHERE section_id=? ORDER BY recorded_at DESC LIMIT ?",
+            (section_id, n)
+        ).fetchall()
+    return [{"data": r["data"], "recorded_at": r["recorded_at"]} for r in rows]
+
+
+def _human_time(iso: str) -> str:
+    """Convert ISO timestamp to human-readable string (Windows-safe, no %-d)."""
+    dt = datetime.fromisoformat(iso).astimezone()
+    now = datetime.now(dt.tzinfo)
+    delta = now - dt
+    if delta.days == 0:
+        return "earlier today"
+    if delta.days == 1:
+        return "yesterday"
+    if delta.days < 7:
+        return f"{delta.days} days ago"
+    return dt.strftime("%d %b %Y").lstrip("0")
+
+
+def format_with_history(section_id: str, current_value: str) -> str:
+    """
+    Wrap current_value with a history note if available.
+    Returns the augmented answer string.
+    """
+    history = get_history(section_id, n=5)
+    # history[0] is the most recent entry — just written by set_cache via _record_history
+    # If there are 2+ entries, compare current to the previous one
+    if len(history) < 2:
+        return current_value
+
+    prev = history[1]  # second-most-recent
+    prev_value  = prev["data"]
+    prev_time   = _human_time(prev["recorded_at"])
+
+    if prev_value == current_value:
+        return f"{current_value}\n\n(Same as {prev_time}.)"
+    return f"{current_value}\n\n(Last time I checked {prev_time}, it was: {prev_value}.)"
 
 
 # ─────────────────────────────────────────────
