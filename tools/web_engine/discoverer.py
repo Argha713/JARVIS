@@ -136,20 +136,30 @@ def discover(query: str, site_id: str, narration,
             # Find best matching section
             hits = store.semantic_search(query, site_id=site_id, n=3)
             if hits:
-                logger.debug("[DISCOVERER] Post-extraction search hits:")
+                logger.info("[DISCOVERER] Post-extraction search hits (threshold={}):",
+                            _AUTO_NAV_THRESHOLD)
                 for i, h in enumerate(hits):
-                    logger.debug("[DISCOVERER]   #{} score={:.3f} label={!r} sid={}",
-                                 i + 1, h["score"], h["label"][:50], h["section_id"][:8])
+                    above = "✓" if h["score"] >= _AUTO_NAV_THRESHOLD else "✗"
+                    logger.info("[DISCOVERER]   #{} [{}] score={:.3f} label={!r} sid={}",
+                                i + 1, above, h["score"], h["label"][:50], h["section_id"][:8])
                 best = hits[0]
-                raw = store.get_cache(best["section_id"])
-                logger.debug("[DISCOVERER] Selected {} label={!r} cache={}",
-                             best["section_id"][:8], best["label"],
-                             repr(raw[:40]) if raw else "MISS")
-                if raw:
-                    answer = store.format_with_history(best["section_id"], raw)
+                if best["score"] < _AUTO_NAV_THRESHOLD:
+                    logger.warning(
+                        "[DISCOVERER] Best score {:.3f} is BELOW threshold {:.2f} — "
+                        "label={!r} — returning None to avoid wrong answer",
+                        best["score"], _AUTO_NAV_THRESHOLD, best["label"][:50]
+                    )
+                    # answer stays None — engine will say "I couldn't find that"
                 else:
-                    answer = best["document"]
-                logger.info("[DISCOVERER] Answer → {!r}", answer[:120])
+                    raw = store.get_cache(best["section_id"])
+                    logger.info("[DISCOVERER] Selected {} label={!r} score={:.3f} cache={}",
+                                best["section_id"][:8], best["label"], best["score"],
+                                repr(raw[:40]) if raw else "MISS")
+                    if raw:
+                        answer = store.format_with_history(best["section_id"], raw)
+                    else:
+                        answer = best["document"]
+                    logger.info("[DISCOVERER] Answer → {!r}", answer[:120])
         else:
             logger.warning("[DISCOVERER] No sections extracted from {!r}", current_url)
 
@@ -431,10 +441,26 @@ def _navigate_to_target_month(page: Page, target: datetime) -> bool:
         dm = displayed_month()
         return dm is not None and dm.year == target.year and dm.month == target.month
 
+    # Log page state before attempting navigation — tells us if the widget even loaded
+    dm_before = displayed_month()
+    logger.info("[MONTH_NAV] Target={} | URL={} | Page shows={}",
+                target.strftime("%B %Y"),
+                page.url,
+                dm_before.strftime("%B %Y") if dm_before else "NO MONTH FOUND IN PAGE")
+    if dm_before is None:
+        try:
+            # Grab a small snippet of visible text to diagnose what the page actually shows
+            snippet = page.evaluate("() => document.body.innerText.slice(0, 600)")
+            logger.debug("[MONTH_NAV] Page text sample: {!r}", snippet)
+        except Exception:
+            pass
+
     if already_there():
         return True
 
-    # JS that finds and clicks the leftmost/prev navigation button near a month header
+    # JS that finds and clicks the leftmost/prev navigation button near a month header.
+    # On failure it returns a JSON diagnostic string (not null) so we can log exactly
+    # what buttons and containers the page had at that moment.
     _CLICK_PREV_JS = """() => {
         // Prefer buttons with explicit prev semantics
         const selectors = [
@@ -464,14 +490,28 @@ def _navigate_to_target_month(page: Page, target: datetime) -> bool:
         for (const container of containers) {
             const btns = Array.from(container.querySelectorAll('button'));
             if (btns.length >= 2) {
-                // leftmost visible button = prev
                 const sorted = btns
                     .filter(b => b.getBoundingClientRect().width > 0)
                     .sort((a, b) => a.getBoundingClientRect().left - b.getBoundingClientRect().left);
                 if (sorted.length) { sorted[0].click(); return 'leftmost'; }
             }
         }
-        return null;
+
+        // Nothing found — return diagnostic so Python can log what was actually on the page
+        const allBtns = Array.from(document.querySelectorAll('button'))
+            .map(b => (b.getAttribute('aria-label') || b.innerText || '').trim().slice(0, 40))
+            .filter(t => t.length > 0)
+            .slice(0, 10);
+        const navCls = Array.from(document.querySelectorAll('[class*="header"],[class*="nav"],[class*="calendar"],[class*="picker"]'))
+            .map(el => el.className.slice(0, 60))
+            .slice(0, 5);
+        return 'DIAGNOSTIC:' + JSON.stringify({
+            total_buttons: document.querySelectorAll('button').length,
+            aria_prev_count: document.querySelectorAll('[aria-label*="prev" i],[aria-label*="previous" i]').length,
+            class_prev_count: document.querySelectorAll('[class*="prev"],[class*="Prev"]').length,
+            button_labels: allBtns,
+            nav_container_classes: navCls
+        });
     }"""
 
     for _attempt in range(13):   # max 13 hops = just over 1 year back
@@ -480,12 +520,27 @@ def _navigate_to_target_month(page: Page, target: datetime) -> bool:
         try:
             result = page.evaluate(_CLICK_PREV_JS)
             if not result:
-                logger.debug("[DISCOVERER] No prev-month button found (attempt {})", _attempt + 1)
+                logger.warning("[MONTH_NAV] JS returned null (attempt {}) — page may still be loading",
+                               _attempt + 1)
                 break
-            logger.debug("[DISCOVERER] Prev-month click via {!r} (attempt {})", result, _attempt + 1)
+            if isinstance(result, str) and result.startswith("DIAGNOSTIC:"):
+                diag = _json.loads(result[len("DIAGNOSTIC:"):])
+                logger.warning(
+                    "[MONTH_NAV] No prev button found (attempt {}) | "
+                    "total_buttons={} aria_prev={} class_prev={} | "
+                    "button_labels={} | nav_containers={}",
+                    _attempt + 1,
+                    diag.get("total_buttons", "?"),
+                    diag.get("aria_prev_count", "?"),
+                    diag.get("class_prev_count", "?"),
+                    diag.get("button_labels", []),
+                    diag.get("nav_container_classes", []),
+                )
+                break
+            logger.debug("[MONTH_NAV] Prev-month click via {!r} (attempt {})", result, _attempt + 1)
             page.wait_for_timeout(700)
         except Exception as e:
-            logger.debug("[DISCOVERER] Month nav click failed: {}", e)
+            logger.debug("[MONTH_NAV] Month nav click failed: {}", e)
             break
 
     return already_there()

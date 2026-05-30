@@ -253,20 +253,90 @@ class CommandRecorder:
 
 
 class Transcriber:
-    """Transcribes audio using faster-whisper (CPU, int8 quantization)."""
+    """
+    Transcribes audio using either:
+      provider=openai  → whisper-1 API (higher accuracy, proper nouns, ~0.5-1s)
+      provider=local   → faster-whisper on CPU (offline fallback, ~0.3-0.8s)
+
+    Set config["whisper"]["provider"] to switch. Falls back to local automatically
+    if the OpenAI call fails (network down, quota, etc.).
+    """
 
     def __init__(self, config: dict):
-        self.model = WhisperModel(
-            config["whisper"]["model_size"],
-            device=config["whisper"]["device"],
-            compute_type=config["whisper"]["compute_type"],
-        )
+        self._provider = config["whisper"].get("provider", "local")
+        self._local_model: WhisperModel | None = None
+        self._openai_client = None
+
+        if self._provider == "openai":
+            import openai as _openai
+            self._openai_client = _openai.OpenAI(
+                api_key=config["llm"].get("openai_api_key", "")
+            )
+            logger.info("[STT] Provider: openai whisper-1")
+        else:
+            self._load_local(config)
+
+    def _load_local(self, config: dict) -> None:
+        if self._local_model is None:
+            self._local_model = WhisperModel(
+                config["whisper"]["model_size"],
+                device=config["whisper"]["device"],
+                compute_type=config["whisper"]["compute_type"],
+            )
+            logger.info("[STT] Provider: faster-whisper ({})", config["whisper"]["model_size"])
 
     def _transcribe(self, audio: np.ndarray) -> str:
-        segments, _ = self.model.transcribe(audio, language="en")
+        if self._provider == "openai" and self._openai_client:
+            return self._transcribe_openai(audio)
+        return self._transcribe_local(audio)
+
+    def _transcribe_local(self, audio: np.ndarray) -> str:
+        segments, _ = self._local_model.transcribe(audio, language="en")
         text = " ".join(seg.text for seg in segments).strip()
-        logger.debug(f"Transcribed: {text!r}")
+        logger.debug("[STT] Transcribed (local): {!r}", text)
         return text
+
+    def _transcribe_openai(self, audio: np.ndarray) -> str:
+        import os
+        import time
+        import tempfile
+        import wave
+
+        # Write float32 audio to a temp WAV file — OpenAI API requires a file object
+        pcm = (audio * 32767).astype(np.int16)
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+                tmp_path = f.name
+            with wave.open(tmp_path, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)       # 16-bit
+                wf.setframerate(TARGET_RATE)
+                wf.writeframes(pcm.tobytes())
+
+            t0 = time.monotonic()
+            with open(tmp_path, "rb") as f:
+                result = self._openai_client.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=f,
+                    language="en",
+                )
+            elapsed = time.monotonic() - t0
+            text = result.text.strip()
+            logger.debug("[STT] Transcribed (openai, {:.2f}s): {!r}", elapsed, text)
+            return text
+
+        except Exception as e:
+            logger.warning("[STT] OpenAI transcription failed: {} — falling back to local", e)
+            if self._local_model:
+                return self._transcribe_local(audio)
+            return ""
+        finally:
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
 
     async def transcribe(self, audio: np.ndarray) -> str:
         loop = asyncio.get_event_loop()
