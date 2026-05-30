@@ -1,4 +1,6 @@
 import asyncio
+import json
+import re
 import time
 from core.llm import LLMEngine
 from core.narration import Narration
@@ -6,6 +8,13 @@ from loguru import logger
 
 MAX_HISTORY_TURNS = 6  # keep last 3 user+assistant pairs
 _PASSTHROUGH_PREFIX = "__PASSTHROUGH__:"
+_CONFIG_PATH = "config.json"
+
+# Regex to detect provider-switch voice commands
+_SWITCH_RE = re.compile(
+    r'\b(switch|change|use|set)\b.{0,20}\b(openai|open\s*ai|ollama)\b',
+    re.IGNORECASE,
+)
 
 
 class TaskRouter:
@@ -104,9 +113,57 @@ class TaskRouter:
 
         return None
 
+    def _handle_provider_switch(self, user_input: str) -> str | None:
+        """
+        Detects 'switch to OpenAI' / 'switch to Ollama' voice commands.
+        Returns spoken response if matched, None otherwise.
+        """
+        m = _SWITCH_RE.search(user_input)
+        if not m:
+            return None
+
+        target = "openai" if "openai" in m.group(2).lower().replace(" ", "") else "ollama"
+
+        try:
+            with open(_CONFIG_PATH, encoding="utf-8") as f:
+                config = json.load(f)
+        except Exception as e:
+            logger.error(f"[SWITCH] Cannot read config: {e}")
+            return "I couldn't read my config file, sir."
+
+        current = config["llm"].get("provider", "ollama")
+        if target == current:
+            return f"I'm already using {target}, sir."
+
+        if target == "openai" and not config["llm"].get("openai_api_key", "").strip():
+            return (
+                "I don't have an OpenAI API key configured yet. "
+                "Please run 'python setup.py' in the terminal to add it, sir."
+            )
+
+        config["llm"]["provider"] = target
+        try:
+            with open(_CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(config, f, indent=4)
+        except Exception as e:
+            logger.error(f"[SWITCH] Cannot write config: {e}")
+            return "I couldn't save the config change, sir."
+
+        self.llm.reload_provider(config)
+        provider_label = "OpenAI" if target == "openai" else "Ollama"
+        logger.info(f"[SWITCH] Switched to {provider_label}")
+        return f"Done. Switched to {provider_label}, sir. No restart needed."
+
     async def handle(self, user_input: str) -> str:
         if not user_input.strip():
             return "I didn't catch that. Could you say that again?"
+
+        # Check for provider switch command before anything else
+        switch_response = self._handle_provider_switch(user_input)
+        if switch_response is not None:
+            self._add_to_history("user", user_input)
+            self._add_to_history("assistant", switch_response)
+            return switch_response
 
         logger.info(f"[ROUTER] ── New request ──────────────────────")
         logger.info(f"[ROUTER] User said: {user_input!r}")
@@ -121,8 +178,10 @@ class TaskRouter:
 
         tool_name = decision.get("tool", "answer")
 
-        if tool_name == "ollama_offline":
-            return "I can't reach my language model right now. Please make sure Ollama is running, sir."
+        if tool_name in ("llm_offline", "ollama_offline"):
+            provider = self.llm._provider
+            hint = "make sure Ollama is running" if provider == "ollama" else "check your OpenAI API key"
+            return f"I can't reach my language model right now. Please {hint}, sir."
 
         # Step 2a: Tool path
         if tool_name != "answer" and self.tools:

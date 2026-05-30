@@ -1,7 +1,6 @@
 import json
 import re
 import time
-import ollama
 from datetime import date
 from loguru import logger
 
@@ -71,10 +70,6 @@ _STYLE_KEYWORDS = _load_style_keywords()
 
 
 def _detect_style(text: str) -> dict:
-    """
-    Returns {"num_predict": N, "length_hint": "..."} based on keywords in
-    data/style_keywords.json. No LLM call — zero latency.
-    """
     t = text.lower()
     if any(k in t for k in _STYLE_KEYWORDS.get("explain", [])):
         return {"num_predict": 500, "length_hint": "Explain thoroughly. You may use up to 150 words."}
@@ -98,38 +93,78 @@ def _routing_system_prompt(length_hint: str = "Keep response under 40 words.") -
 
 class LLMEngine:
     def __init__(self, config: dict):
-        self.client = ollama.AsyncClient(host=config["llm"]["ollama_host"])
-        self.fast_model = config["llm"]["fast_model"]
-        self.smart_model = config["llm"]["smart_model"]
+        self._init_provider(config)
+
+    def _init_provider(self, config: dict) -> None:
+        llm_cfg = config["llm"]
+        self._provider = llm_cfg.get("provider", "ollama")
+
+        if self._provider == "openai":
+            import openai
+            self._client = openai.AsyncOpenAI(api_key=llm_cfg.get("openai_api_key", ""))
+            self.fast_model  = llm_cfg.get("openai_fast_model", "gpt-4o-mini")
+            self.smart_model = llm_cfg.get("openai_smart_model", "gpt-4o")
+        else:
+            import ollama
+            self._client = ollama.AsyncClient(host=llm_cfg.get("ollama_host", "http://localhost:11434"))
+            self.fast_model  = llm_cfg.get("fast_model", "phi3")
+            self.smart_model = llm_cfg.get("smart_model", "llama3.1:8b")
+
+        logger.info(f"[LLM] Provider: {self._provider} | fast={self.fast_model} | smart={self.smart_model}")
+
+    def reload_provider(self, config: dict) -> None:
+        """Hot-swap provider without restarting JARVIS."""
+        self._init_provider(config)
+
+    async def _chat(self, model: str, messages: list, num_predict: int) -> str:
+        """Single call point for both providers. Raises on connection failure."""
+        if self._provider == "openai":
+            response = await self._client.chat.completions.create(
+                model=model,
+                messages=messages,
+                max_tokens=num_predict,
+            )
+            return response.choices[0].message.content.strip()
+        else:
+            response = await self._client.chat(
+                model=model,
+                messages=messages,
+                options={"num_predict": num_predict},
+            )
+            return response["message"]["content"].strip()
 
     async def classify(self, text: str) -> str:
-        response = await self.client.chat(
-            model=self.fast_model,
-            messages=[
-                {"role": "system", "content": CLASSIFY_PROMPT},
-                {"role": "user", "content": text},
-            ],
-        )
-        result = response["message"]["content"].strip().upper()
-        return "COMPLEX" if "COMPLEX" in result else "SIMPLE"
+        try:
+            result = await self._chat(
+                self.fast_model,
+                [
+                    {"role": "system", "content": CLASSIFY_PROMPT},
+                    {"role": "user",   "content": text},
+                ],
+                num_predict=10,
+            )
+            return "COMPLEX" if "COMPLEX" in result.upper() else "SIMPLE"
+        except Exception as e:
+            logger.warning(f"[CLASSIFY] Error: {e} — defaulting to SIMPLE")
+            return "SIMPLE"
 
     async def route(self, text: str) -> dict:
         logger.info(f"[ROUTE] Input: {text!r}")
         t0 = time.perf_counter()
 
         try:
-            response = await self.client.chat(
-                model=self.fast_model,
-                messages=[
+            raw = await self._chat(
+                self.fast_model,
+                [
                     {"role": "system", "content": ROUTE_PROMPT},
-                    {"role": "user", "content": text},
+                    {"role": "user",   "content": text},
                 ],
-                options={"num_predict": 100},
+                num_predict=100,
             )
-        except ConnectionError:
-            logger.error("[ROUTE] Ollama is not running — cannot route request")
-            return {"tool": "ollama_offline"}
-        raw = response["message"]["content"].strip()
+        except Exception as e:
+            logger.error(f"[ROUTE] LLM unreachable: {e}")
+            return {"tool": "llm_offline"}
+
         elapsed = time.perf_counter() - t0
         logger.info(f"[ROUTE] LLM raw ({elapsed:.1f}s): {raw!r}")
 
@@ -137,23 +172,21 @@ class LLMEngine:
             try:
                 result = json.loads(raw)
             except json.JSONDecodeError:
-                # Strip markdown fences if present
                 if "```" in raw:
                     raw = raw.split("```")[1].lstrip("json").strip()
-                # Extract from first { to last } — handles trailing LLM commentary
                 start = raw.find('{')
                 end   = raw.rfind('}')
                 if start != -1 and end != -1 and end > start:
                     raw = raw[start:end + 1]
                 result = json.loads(raw)
 
-            # phi3 sometimes returns {"tool_sequence": [...]} — extract first entry
+            # phi3 sometimes returns {"tool_sequence": [...]}
             if "tool_sequence" in result:
                 seq = result.get("tool_sequence", [])
                 result = seq[0] if seq else {"tool": "answer"}
                 logger.info(f"[ROUTE] Extracted first from tool_sequence: {result}")
 
-            # phi3 sometimes uses "action" as the top-level key instead of "tool"
+            # phi3 sometimes uses "action" as top-level key
             if "tool" not in result and "action" in result:
                 action_val = result.get("action", "")
                 if action_val in KNOWN_TOOLS:
@@ -181,12 +214,11 @@ class LLMEngine:
             complexity = await self.classify(prompt)
             model = self.smart_model if complexity == "COMPLEX" else self.fast_model
 
-        # Auto-detect response style from the question unless caller overrides
         if style is None:
             style = _detect_style(prompt)
 
-        num_predict   = style["num_predict"]
-        length_hint   = style["length_hint"]
+        num_predict = style["num_predict"]
+        length_hint = style["length_hint"]
 
         messages = [{"role": "system", "content": _routing_system_prompt(length_hint)}]
         if history:
@@ -194,21 +226,17 @@ class LLMEngine:
         messages.append({"role": "user", "content": prompt})
 
         logger.info(
-            f"[LLM] Model: {model} | Style: num_predict={num_predict} | "
-            f"History: {len(history) if history else 0} turns | Prompt: {prompt[:100]!r}"
+            f"[LLM] Provider: {self._provider} | Model: {model} | "
+            f"Style: num_predict={num_predict} | History: {len(history) if history else 0} turns"
         )
         t0 = time.perf_counter()
 
         try:
-            response = await self.client.chat(
-                model=model,
-                messages=messages,
-                options={"num_predict": num_predict},
-            )
-        except ConnectionError:
-            logger.error("[LLM] Ollama is not running")
-            return "I can't reach my language model right now. Please make sure Ollama is running."
-        answer = response["message"]["content"].strip()
+            answer = await self._chat(model, messages, num_predict)
+        except Exception as e:
+            logger.error(f"[LLM] Error: {e}")
+            return "I can't reach my language model right now. Please check your provider settings, sir."
+
         elapsed = time.perf_counter() - t0
         logger.info(f"[LLM] Done in {elapsed:.1f}s | Response ({len(answer)} chars):\n{answer}")
         return answer

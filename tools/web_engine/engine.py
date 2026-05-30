@@ -21,6 +21,7 @@ class WebEngine:
     def __init__(self, narration, config: dict):
         self.narration = narration
         self._pending_query: tuple[str, str] | None = None  # (query, site_id) waiting for user confirmation
+        self._last_page_url: dict[str, str] = {}  # site_id → last discovered page URL, used for temporal follow-ups
         store.init_db()
         # Validator uses sync Playwright — must run in a thread, not in the asyncio loop
         threading.Thread(target=validator.run_if_due, daemon=True).start()
@@ -75,7 +76,15 @@ class WebEngine:
         # Unknown or time-specific — discover
         logger.info("[ENGINE] Discovering for query: {!r}", query)
         self.narration.step("I haven't seen this before — let me find it.")
-        answer = discoverer.discover(query, site_id, self.narration)
+        # For temporal follow-ups (needs_fresh), pass the last known page URL so
+        # the discoverer starts directly on /my-activity (or /leave etc.) rather
+        # than from the portal home page and failing to navigate there.
+        start_url_hint = self._last_page_url.get(site_id) if needs_fresh else None
+        if start_url_hint:
+            logger.info("[ENGINE] Passing last page URL hint to discoverer: {}", start_url_hint)
+        answer, page_url = discoverer.discover(query, site_id, self.narration, start_url=start_url_hint)
+        if page_url:
+            self._last_page_url[site_id] = page_url
         if answer == _PORTAL_TIMEOUT:
             self._pending_query = (query, site_id)
             logger.info("[ENGINE] Portal timeout — asking user if they want background check")

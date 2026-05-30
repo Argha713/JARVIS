@@ -34,35 +34,41 @@ from tools.web_engine.extractor import extract_page
 _AUTO_NAV_THRESHOLD = 0.35
 
 
-def discover(query: str, site_id: str, narration) -> str | None:
+def discover(query: str, site_id: str, narration,
+             start_url: str | None = None) -> tuple[str | None, str | None]:
     """
     Foreground guided discovery.
-    Opens visible browser, finds data, returns answer string or None.
+    Opens visible browser, finds data, returns (answer, page_url) or (None, None).
+    start_url: if provided, go there directly — skips home-page navigation logic.
+               Used by temporal follow-ups so they land on /my-activity (not home).
     """
     site = store.get_site(site_id)
     if not site:
         logger.error("[DISCOVERER] Unknown site: {}", site_id)
-        return None
+        return None, None
 
     base_url = site["base_url"]
 
     # Ensure login
     ok = login_action.ensure_session(site_id, narration)
     if not ok:
-        return "Login failed or timed out."
+        return "Login failed or timed out.", None
 
     narration.say("Let me find that for you, sir.")
 
     session = store.load_session(site_id)
     ctx_kwargs = {"storage_state": session} if session else {}
 
-    # Use a known page or a direct URL hint, or fall back to home
-    start_url = (
-        _find_known_page_url(query, site_id)
-        or _get_direct_url_hint(query, site_id, base_url)
-        or base_url
-    )
+    # Caller may provide a start_url (temporal follow-ups reuse the last known page).
+    # Otherwise fall back to the normal hint chain.
+    if start_url is None:
+        start_url = (
+            _find_known_page_url(query, site_id)
+            or _get_direct_url_hint(query, site_id, base_url)
+            or base_url
+        )
 
+    current_url = None
     answer = None
     pw = sync_playwright().start()
     try:
@@ -79,7 +85,7 @@ def discover(query: str, site_id: str, narration) -> str | None:
             except Exception as retry_err:
                 logger.error("[DISCOVERER] Portal unreachable after retry: {}", retry_err)
                 browser.close()
-                return "__PORTAL_TIMEOUT__"
+                return "__PORTAL_TIMEOUT__", None
         _wait_for_content(page)
         logger.info("[DISCOVERER] Starting discovery from: {}", page.url)
 
@@ -131,7 +137,7 @@ def discover(query: str, site_id: str, narration) -> str | None:
         except Exception:
             pass
 
-    return answer
+    return answer, current_url
 
 
 def _navigate_to_data(page: Page, query: str, site_id: str, narration) -> Page:
