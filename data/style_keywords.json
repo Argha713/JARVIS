@@ -1,0 +1,26 @@
+{
+    "_comment": "Add words/phrases here to tune how JARVIS decides response length. No code change needed.",
+
+    "explain": [
+        "explain", "in detail", "elaborate", "how does", "how do",
+        "why does", "why do", "tell me everything", "describe",
+        "walk me through", "what is the difference", "compare",
+        "pros and cons", "deep dive", "break it down", "break down",
+        "give me more", "tell me more", "go deeper", "in depth"
+    ],
+
+    "chat": [
+        "what do you think", "your opinion", "do you think", "do you like",
+        "are you", "how are you", "hi jarvis", "hello", "hey jarvis",
+        "what's up", "talk to me", "tell me something", "let's chat",
+        "just talking", "are you there", "you okay", "good morning",
+        "good evening", "good night"
+    ],
+
+    "quick": [
+        "what is ", "who is ", "who are ", "when did ", "when was ",
+        "where is ", "what time", "what year", "how many", "how much",
+        "is it ", "are they ", "did it ", "does it ", "will it ",
+        "quick question", "just tell me", "briefly", "short answer"
+    ]
+}

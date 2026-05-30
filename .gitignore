@@ -1,0 +1,31 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Sensitive — session cookies/login state
+data/portal_session.json
+
+# Runtime databases
+data/chromadb/
+data/web_engine.db
+
+# Generated / temp files
+data/tts_output.wav
+data/portal_activity_debug.html
+data/portal_activity_debug.png
+data/portal_discovery/
+
+# Logs
+logs/
+
+# Large binary model files (re-downloadable)
+models/
+
+# Config with personal settings (commit a config.example.json instead)
+config.json
+
+# OS
+Thumbs.db
+desktop.ini
