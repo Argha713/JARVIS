@@ -37,9 +37,12 @@ class WebSearch:
         lines = []
         for i, r in enumerate(results, 1):
             title = r.get("title", "")
-            body = r.get("body", "")[:MAX_SNIPPET_CHARS]
-            url = r.get("href", "")
-            logger.debug(f"[WEB] Result {i}: {title!r} | {url}")
-            lines.append(f"{i}. {title}\n   {body}\n   Source: {url}")
+            body  = r.get("body", "")
+            url   = r.get("href", "")
+            logger.debug("[WEB] Result {}:\n   Title: {}\n   URL:   {}\n   Body:  {!r}",
+                         i, title, url, body[:500])
+            lines.append(f"{i}. {title}\n   {body[:MAX_SNIPPET_CHARS]}\n   Source: {url}")
 
-        return f"Web results for '{query}':\n\n" + "\n\n".join(lines)
+        result_str = f"Web results for '{query}':\n\n" + "\n\n".join(lines)
+        logger.debug("[WEB] Full result sent to LLM ({} chars):\n{}", len(result_str), result_str)
+        return result_str

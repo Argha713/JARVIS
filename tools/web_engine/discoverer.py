@@ -79,13 +79,24 @@ def discover(query: str, site_id: str, narration,
         context = browser.new_context(**ctx_kwargs)
         page    = context.new_page()
 
-        # Intercept all JSON responses — captures API endpoints for future direct calls
+        # Intercept all JSON responses — captures URL, HTTP method, POST body, and response data
         _captured_api: dict = {}
         def _on_response(response):
             try:
                 ct = response.headers.get("content-type", "")
                 if "json" in ct and response.status == 200:
-                    _captured_api[response.url] = response.json()
+                    method = response.request.method
+                    body = None
+                    if method == "POST":
+                        try:
+                            body = response.request.post_data  # raw POST body string
+                        except Exception:
+                            pass
+                    _captured_api[response.url] = {
+                        "data":   response.json(),
+                        "method": method,
+                        "body":   body,
+                    }
             except Exception:
                 pass
         page.on("response", _on_response)
@@ -633,25 +644,72 @@ _SKIP_API_PATHS = ("/auth/", "/login/", "/token", "/refresh", "/logout",
                    "/healthz", "/metrics", "/static/", "/favicon")
 
 
+_AUTH_RESPONSE_KEYS = {"access_token", "refresh_token", "token", "jwt_expiry", "bearer_token"}
+
+
 def _save_captured_endpoints(site_id: str, page_url: str, captured: dict) -> None:
     """Persist intercepted JSON API calls to the api_endpoints table."""
     page_name = _url_to_page_name(page_url)
-    if not page_name or not captured:
+    logger.debug("[DISCOVERER] _save_captured_endpoints: page_url={!r} page_name={!r} captured={}",
+                 page_url, page_name, len(captured))
+
+    if not page_name:
+        logger.debug("[DISCOVERER] Skip save — URL {!r} does not map to a known page_name", page_url)
         return
+    if not captured:
+        logger.debug("[DISCOVERER] Skip save — no API calls were intercepted")
+        return
+
     saved = 0
-    for raw_url, data in captured.items():
+    skipped_auth = 0
+    skipped_small = 0
+    skipped_path = 0
+
+    for raw_url, captured_info in captured.items():
+        # Handle both new format (dict with data/method/body) and old format (raw data)
+        if isinstance(captured_info, dict) and "data" in captured_info:
+            data   = captured_info["data"]
+            method = captured_info.get("method", "GET")
+            body   = captured_info.get("body")
+        else:
+            data   = captured_info
+            method = "GET"
+            body   = None
+
+        # Skip responses with too few fields — likely not data endpoints
         if not isinstance(data, dict) or len(data) < 2:
+            skipped_small += 1
+            logger.debug("[DISCOVERER] Skip {!r} — response has <2 fields (type={}, len={})",
+                         raw_url, type(data).__name__, len(data) if isinstance(data, dict) else "n/a")
             continue
+
+        # Skip known infrastructure paths
         if any(skip in raw_url for skip in _SKIP_API_PATHS):
+            skipped_path += 1
+            logger.debug("[DISCOVERER] Skip {!r} — matches _SKIP_API_PATHS", raw_url)
             continue
+
+        # Skip auth/session endpoints — they return JWT tokens, not HR data
+        nested = data.get("result", data)
+        if isinstance(nested, dict) and _AUTH_RESPONSE_KEYS & nested.keys():
+            skipped_auth += 1
+            found_keys = _AUTH_RESPONSE_KEYS & nested.keys()
+            logger.debug("[DISCOVERER] Skip {!r} — auth response keys found: {}", raw_url, found_keys)
+            continue
+
         # Strip query params — month/page params are injected dynamically at call time
         parsed = urlparse(raw_url)
         clean_url = urlunparse(parsed._replace(query="", fragment=""))
-        store.save_api_endpoint(site_id, page_name, clean_url, "GET",
-                                _json.dumps(data))
+
+        logger.debug("[DISCOVERER] Saving endpoint: method={} url={} body={}",
+                     method, clean_url, repr(body[:100]) if body else "none")
+        store.save_api_endpoint(site_id, page_name, clean_url, method,
+                                _json.dumps(data), request_body=body)
         saved += 1
-    if saved:
-        logger.info("[DISCOVERER] Saved {} API endpoint(s) for page={!r}", saved, page_name)
+
+    logger.info("[DISCOVERER] Endpoint save summary: saved={} skipped_auth={} "
+                "skipped_small={} skipped_path={} (page={!r})",
+                saved, skipped_auth, skipped_small, skipped_path, page_name)
 
 
 def _start_background_enrichment(site_id: str, page_id: str,

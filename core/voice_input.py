@@ -71,7 +71,7 @@ class WakeWordListener:
     Runs openwakeword in a background thread using WDM-KS callback-based audio.
     Posts 'WAKE' to wake_queue via call_soon_threadsafe when the wake word is detected.
     """
-    DETECTION_THRESHOLD = 0.2
+    DETECTION_THRESHOLD = 0.15
     OWW_CHUNK_16K = 1280                                          # 80ms at 16kHz
     NATIVE_CHUNK = int(OWW_CHUNK_16K * NATIVE_RATE / TARGET_RATE)  # 3840 at 48kHz
 
@@ -305,14 +305,11 @@ class Transcriber:
         # Write float32 audio to a temp WAV file — OpenAI API requires a file object
         pcm = (audio * 32767).astype(np.int16)
 
-        # Guard: OpenAI Whisper hallucinates on silence/ambient noise.
-        # Compute RMS on the int16 PCM. Normal speech is 2000–15000; ambient
-        # noise / near-silence that sneaked past the recording threshold is
-        # typically < 300. Skip the API call entirely if energy is too low.
+        # Log RMS for calibration — only block truly digital silence (all zeros).
         rms = float(np.sqrt(np.mean(pcm.astype(np.float32) ** 2)))
-        logger.debug("[STT] Audio RMS: {:.0f} (threshold=300)", rms)
-        if rms < 300:
-            logger.debug("[STT] Audio too quiet — skipping Whisper call (rms={:.0f})", rms)
+        logger.debug("[STT] Audio RMS: {:.0f}", rms)
+        if rms < 10:
+            logger.debug("[STT] Audio is digital silence (rms={:.0f}) — skipping", rms)
             return ""
 
         tmp_path = None

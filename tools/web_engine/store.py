@@ -122,11 +122,19 @@ def init_db() -> None:
             url             TEXT    NOT NULL,
             method          TEXT    NOT NULL DEFAULT 'GET',
             sample_response TEXT,
+            request_body    TEXT,
             discovered_at   TEXT    NOT NULL,
             last_used_at    TEXT,
             UNIQUE(site_id, page_name, url)
         );
         """)
+    # Migrate existing DB: add request_body column if the table was created before this field
+    try:
+        with _db() as con:
+            con.execute("ALTER TABLE api_endpoints ADD COLUMN request_body TEXT")
+        logger.debug("[STORE] Migrated api_endpoints: added request_body column")
+    except Exception:
+        pass  # Column already exists — normal on fresh start after schema update
     logger.debug("[STORE] DB initialised at {}", _DB_PATH)
 
 
@@ -418,30 +426,34 @@ def get_all_actions_for_site(site_id: str) -> list[dict]:
 # ─────────────────────────────────────────────
 
 def save_api_endpoint(site_id: str, page_name: str, url: str,
-                      method: str, sample_response: str) -> None:
+                      method: str, sample_response: str,
+                      request_body: str = None) -> None:
     with _db() as con:
         con.execute(
             """INSERT INTO api_endpoints
-               (site_id, page_name, url, method, sample_response, discovered_at)
-               VALUES (?,?,?,?,?,?)
+               (site_id, page_name, url, method, sample_response, request_body, discovered_at)
+               VALUES (?,?,?,?,?,?,?)
                ON CONFLICT(site_id, page_name, url) DO UPDATE SET
                    sample_response = excluded.sample_response,
+                   method          = excluded.method,
+                   request_body    = excluded.request_body,
                    discovered_at   = excluded.discovered_at""",
-            (site_id, page_name, url, method, sample_response, _now())
+            (site_id, page_name, url, method, sample_response, request_body, _now())
         )
-    logger.debug("[STORE] API endpoint saved: {} {} (page={})", method, url, page_name)
+    logger.debug("[STORE] API endpoint saved: {} {} (page={}) body={}",
+                 method, url, page_name, "yes" if request_body else "none")
 
 
 def get_api_endpoints(site_id: str, page_name: str) -> list[dict]:
     with _db() as con:
         rows = con.execute(
-            """SELECT id, url, method, sample_response FROM api_endpoints
+            """SELECT id, url, method, sample_response, request_body FROM api_endpoints
                WHERE site_id=? AND page_name=?
                ORDER BY COALESCE(last_used_at, discovered_at) DESC""",
             (site_id, page_name)
         ).fetchall()
     return [{"id": r["id"], "url": r["url"], "method": r["method"],
-             "sample": r["sample_response"]} for r in rows]
+             "sample": r["sample_response"], "body": r["request_body"]} for r in rows]
 
 
 def touch_endpoint(endpoint_id: int) -> None:

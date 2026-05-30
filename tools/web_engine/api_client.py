@@ -5,12 +5,18 @@ After the discoverer has intercepted and saved API endpoint URLs on a first visi
 every subsequent query for that page hits the API directly via httpx — no browser,
 no DOM, no semantic search.  Total round-trip: ~300 ms.
 
+Auth flow (Simplified HR / people.codeclouds.com):
+  1. Call getAccessData with session cookies → get JWT access_token
+  2. Add "Authorization: Bearer <token>" to all processRequest* calls
+  3. Token cached in-memory for 12h (server expiry is 14 days)
+
 Public surface:
     call_page(site_id, page_name, query)  -> dict | None
     format_answer(query, data)            -> str
     AuthExpired                           (exception)
 """
 import json
+import time
 
 import httpx
 from loguru import logger
@@ -18,9 +24,90 @@ from loguru import logger
 from tools.web_engine import store
 from tools.web_engine.discoverer import _extract_month_target
 
+# Auth endpoint for Simplified HR — returns Bearer token using session cookies.
+# NOT a data endpoint — never saved to api_endpoints table.
+_GET_ACCESS_DATA_URL = "https://hr.besimplified.com/api/server/getAccessData"
+_BEARER_TTL_SECONDS  = 12 * 3600   # re-fetch after 12h (server expiry is 14 days)
+
+# In-memory token cache: site_id → {"token": str, "fetched_at": float}
+_bearer_cache: dict[str, dict] = {}
+
 
 class AuthExpired(Exception):
     """Raised when the portal session is invalid (401 / redirect to login)."""
+
+
+def _get_bearer_token(site_id: str, cookies: dict, force_refresh: bool = False) -> str | None:
+    """
+    Get a Bearer token for portal API calls.
+
+    1. Check in-memory cache (TTL=12h). Return cached token if fresh.
+    2. Otherwise call getAccessData with session cookies and cache the result.
+    3. If getAccessData returns HTML (cookies expired), returns None.
+    """
+    if not force_refresh:
+        cached = _bearer_cache.get(site_id)
+        if cached:
+            age = time.time() - cached["fetched_at"]
+            if age < _BEARER_TTL_SECONDS:
+                logger.debug("[API_CLIENT] Bearer token from cache (age={:.0f}s, ttl={}s)",
+                             age, _BEARER_TTL_SECONDS)
+                return cached["token"]
+            logger.debug("[API_CLIENT] Bearer cache stale (age={:.0f}s) → refreshing", age)
+        else:
+            logger.debug("[API_CLIENT] No cached Bearer token → fetching fresh")
+    else:
+        logger.info("[API_CLIENT] Force-refresh Bearer token requested")
+
+    logger.info("[API_CLIENT] Calling getAccessData: {}", _GET_ACCESS_DATA_URL)
+    try:
+        resp = httpx.get(
+            _GET_ACCESS_DATA_URL,
+            cookies=cookies,
+            timeout=10.0,
+            follow_redirects=False,
+        )
+        logger.info("[API_CLIENT] getAccessData → HTTP {} | Content-Type: {}",
+                    resp.status_code, resp.headers.get("content-type", "?"))
+
+        if resp.status_code != 200:
+            logger.warning("[API_CLIENT] getAccessData failed: HTTP {} → no Bearer token",
+                           resp.status_code)
+            return None
+
+        raw = resp.text
+        if raw.lstrip().startswith("<") or "<!DOCTYPE" in raw[:100]:
+            logger.warning("[API_CLIENT] getAccessData returned HTML (session cookies expired) "
+                           "→ cannot get Bearer token → need re-login")
+            return None
+
+        data = resp.json()
+        token = data.get("result", {}).get("access_token")
+        expiry = data.get("result", {}).get("jwt_expiry", "?")
+
+        if not token:
+            logger.warning("[API_CLIENT] getAccessData response has no access_token field. "
+                           "Keys: {}", list(data.get("result", {}).keys()))
+            return None
+
+        _bearer_cache[site_id] = {"token": token, "fetched_at": time.time()}
+        logger.info("[API_CLIENT] Bearer token obtained and cached ✓ "
+                    "(server expiry={}s ≈ {:.0f} days)", expiry, int(expiry or 0) / 86400)
+        logger.debug("[API_CLIENT] Token preview: {}...{}", token[:20], token[-10:])
+        return token
+
+    except Exception as e:
+        logger.warning("[API_CLIENT] getAccessData request failed: {} → no Bearer token", e)
+        return None
+
+
+def _invalidate_bearer(site_id: str) -> None:
+    """Clear cached Bearer token — call when a request returns unexpected HTML."""
+    removed = _bearer_cache.pop(site_id, None)
+    if removed:
+        logger.info("[API_CLIENT] Bearer token cache invalidated for {}", site_id)
+    else:
+        logger.debug("[API_CLIENT] Bearer cache already empty for {}", site_id)
 
 
 def call_page(site_id: str, page_name: str, query: str) -> dict | None:
@@ -33,103 +120,230 @@ def call_page(site_id: str, page_name: str, query: str) -> dict | None:
     endpoints = store.get_api_endpoints(site_id, page_name)
 
     if not endpoints:
-        logger.debug("[API_CLIENT] No endpoints saved for site={!r} page={!r} — skipping API path",
-                     site_id, page_name)
+        logger.debug("[API_CLIENT] Decision: no endpoints saved for site={!r} page={!r} "
+                     "→ skip API path, fall through to cache/discoverer", site_id, page_name)
         return None
 
     logger.info("[API_CLIENT] ── API call ─────────────────────────────")
     logger.info("[API_CLIENT] Site: {}  |  Page: {}", site_id, page_name)
     logger.info("[API_CLIENT] Query: {!r}", query)
     logger.info("[API_CLIENT] Saved endpoints: {}", len(endpoints))
+    for i, ep in enumerate(endpoints, 1):
+        logger.debug("[API_CLIENT]   Endpoint {}: method={} url={} body={}",
+                     i, ep.get("method", "GET"), ep["url"],
+                     "yes" if ep.get("body") else "none")
 
     session = store.load_session(site_id)
     if not session:
+        logger.warning("[API_CLIENT] Decision: no session saved → raising AuthExpired")
         raise AuthExpired("No session saved for " + site_id)
 
     cookies = {c["name"]: c["value"] for c in session.get("cookies", [])}
     logger.debug("[API_CLIENT] Session cookies loaded: {} cookie(s)", len(cookies))
 
+    # ── Step 1: Get Bearer token via getAccessData ───────────────────────────
+    # The portal (Simplified HR) requires Authorization: Bearer <JWT> on all
+    # data API calls. The token is obtained by calling getAccessData with the
+    # session cookies, then cached in-memory for 12 hours.
+    bearer = _get_bearer_token(site_id, cookies)
+    if not bearer:
+        logger.warning("[API_CLIENT] Decision: could not obtain Bearer token "
+                       "→ raising AuthExpired (session cookies likely expired)")
+        raise AuthExpired("Could not obtain Bearer token for " + site_id)
+
     headers = {
         "Accept":           "application/json",
         "X-Requested-With": "XMLHttpRequest",
+        "Content-Type":     "application/json",
+        "Authorization":    f"Bearer {bearer}",
     }
+    logger.info("[API_CLIENT] Headers: Authorization=Bearer <token>, Accept=application/json")
 
     # Resolve optional month parameter from the query text
     params: dict = {}
     month_target = _extract_month_target(query)
     if month_target:
         params["month"] = f"{month_target.year}-{month_target.month:02d}"
-        logger.info("[API_CLIENT] Month param resolved: {}", params["month"])
+        logger.info("[API_CLIENT] Decision: month target found in query → adding param month={}",
+                    params["month"])
+    else:
+        logger.debug("[API_CLIENT] Decision: no month target in query → no month param")
 
     for i, ep in enumerate(endpoints, 1):
-        url = ep["url"]
+        url    = ep["url"]
+        method = ep.get("method", "GET").upper()
+        body   = ep.get("body")  # raw POST body string captured during discovery
+
         full_url = f"{url}?{'&'.join(f'{k}={v}' for k, v in params.items())}" if params else url
-        logger.info("[API_CLIENT] Trying endpoint {}/{}: {}", i, len(endpoints), full_url)
+        logger.info("[API_CLIENT] ── Endpoint {}/{} ─────────────────────────────", i, len(endpoints))
+        logger.info("[API_CLIENT]   Method: {}", method)
+        logger.info("[API_CLIENT]   URL:    {}", full_url)
+        if body:
+            logger.debug("[API_CLIENT]   Body:   {}", body[:300])
+        else:
+            logger.debug("[API_CLIENT]   Body:   none (GET or no body captured)")
 
         try:
-            resp = httpx.get(
-                url,
-                cookies=cookies,
-                headers=headers,
-                params=params,
-                timeout=10.0,
-                follow_redirects=False,
-            )
+            if method == "POST":
+                logger.debug("[API_CLIENT] Decision: method=POST → using httpx.post with stored body")
+                # Try to parse body as JSON for proper Content-Type handling
+                json_body = None
+                raw_body  = None
+                if body:
+                    try:
+                        json_body = json.loads(body)
+                        logger.debug("[API_CLIENT]   POST body parsed as JSON: {}", json_body)
+                    except Exception:
+                        raw_body = body.encode() if isinstance(body, str) else body
+                        logger.debug("[API_CLIENT]   POST body is raw (not JSON): {!r}", body[:100])
+                resp = httpx.post(
+                    url,
+                    cookies=cookies,
+                    headers=headers,
+                    params=params,
+                    json=json_body,
+                    content=raw_body,
+                    timeout=10.0,
+                    follow_redirects=False,
+                )
+            else:
+                logger.debug("[API_CLIENT] Decision: method=GET → using httpx.get")
+                resp = httpx.get(
+                    url,
+                    cookies=cookies,
+                    headers=headers,
+                    params=params,
+                    timeout=10.0,
+                    follow_redirects=False,
+                )
 
-            logger.info("[API_CLIENT] Response: HTTP {}", resp.status_code)
+            logger.info("[API_CLIENT]   Response: HTTP {} | Content-Type: {}",
+                        resp.status_code, resp.headers.get("content-type", "unknown"))
 
+            # ── Auth failures ────────────────────────────────────────────────
             if resp.status_code in (401, 403):
-                logger.warning("[API_CLIENT] Auth failure ({}) — session likely expired", resp.status_code)
+                logger.warning("[API_CLIENT] Decision: HTTP {} → session expired → raising AuthExpired",
+                               resp.status_code)
                 raise AuthExpired(f"HTTP {resp.status_code} from {url}")
 
-            # 302 = portal bouncing us to Google login
+            # ── Redirect = session bounce to login ───────────────────────────
             if resp.is_redirect or resp.status_code == 302:
                 location = resp.headers.get("location", "?")
-                logger.warning("[API_CLIENT] Redirect → {} (session expired)", location)
+                logger.warning("[API_CLIENT] Decision: redirect → {} → session expired → raising AuthExpired",
+                               location)
                 raise AuthExpired(f"Redirect (session expired): {url}")
 
+            # ── Not found ────────────────────────────────────────────────────
             if resp.status_code == 404:
-                logger.warning("[API_CLIENT] 404 — endpoint does not exist, removing from DB: {}", url)
+                logger.warning("[API_CLIENT] Decision: 404 → endpoint doesn't exist → removing from DB: {}",
+                               url)
                 _delete_endpoint(ep["id"], url)
                 continue
 
+            # ── Server error ─────────────────────────────────────────────────
             if resp.status_code >= 500:
-                logger.warning("[API_CLIENT] Server error {} — skipping this endpoint", resp.status_code)
+                logger.warning("[API_CLIENT] Decision: server error {} → skip this endpoint, try next",
+                               resp.status_code)
                 continue
 
+            # ── Success ──────────────────────────────────────────────────────
             if resp.status_code == 200:
+                # Log raw response text first (always)
+                raw_text = resp.text
+                logger.debug("[API_CLIENT]   Raw response text ({} bytes):\n{}",
+                             len(raw_text),
+                             raw_text[:4000] + (" ... [truncated]" if len(raw_text) > 4000 else ""))
+
+                # Detect HTML — portal returned login/logout page instead of JSON.
+                # This means the Bearer token was rejected. Invalidate it and
+                # try a one-time refresh — if fresh token still gives HTML, the
+                # session itself is expired (raise AuthExpired).
+                if raw_text.lstrip().startswith("<") or "<!DOCTYPE" in raw_text[:100]:
+                    logger.warning("[API_CLIENT] Decision: response is HTML → Bearer token rejected "
+                                   "by endpoint {} → invalidating cache and fetching fresh token", url)
+                    _invalidate_bearer(site_id)
+                    fresh_bearer = _get_bearer_token(site_id, cookies, force_refresh=True)
+                    if not fresh_bearer:
+                        logger.warning("[API_CLIENT] Decision: fresh token fetch failed → "
+                                       "session expired → raising AuthExpired")
+                        raise AuthExpired(f"Bearer token refresh failed for {url}")
+                    # Retry this one endpoint with fresh token
+                    headers["Authorization"] = f"Bearer {fresh_bearer}"
+                    logger.info("[API_CLIENT] Retrying {} with fresh Bearer token", url)
+                    try:
+                        if method == "POST":
+                            resp = httpx.post(url, cookies=cookies, headers=headers,
+                                              params=params, json=json_body, content=raw_body,
+                                              timeout=10.0, follow_redirects=False)
+                        else:
+                            resp = httpx.get(url, cookies=cookies, headers=headers,
+                                             params=params, timeout=10.0, follow_redirects=False)
+                        raw_text = resp.text
+                        logger.info("[API_CLIENT] Retry response: HTTP {}", resp.status_code)
+                        if raw_text.lstrip().startswith("<") or "<!DOCTYPE" in raw_text[:100]:
+                            logger.warning("[API_CLIENT] Decision: retry also returned HTML → "
+                                           "session truly expired → raising AuthExpired")
+                            raise AuthExpired(f"HTML even with fresh token: {url}")
+                        logger.info("[API_CLIENT] Retry succeeded with fresh token ✓")
+                        # Fall through to JSON parsing below
+                    except AuthExpired:
+                        raise
+                    except Exception as retry_err:
+                        logger.warning("[API_CLIENT] Retry failed: {} → skip endpoint", retry_err)
+                        continue
+
                 try:
                     data = resp.json()
                 except Exception as parse_err:
-                    logger.warning("[API_CLIENT] Response is not JSON: {}", parse_err)
+                    logger.warning("[API_CLIENT] Decision: response is not valid JSON ({}) "
+                                   "→ skipping endpoint: {}", parse_err, url)
                     continue
 
-                if isinstance(data, dict):
-                    logger.info("[API_CLIENT] Success — {} field(s): {}",
-                                len(data), list(data.keys()))
-                    _log_data_preview(data)
-                elif isinstance(data, list):
-                    logger.info("[API_CLIENT] Success — list with {} item(s)", len(data))
-                else:
-                    logger.info("[API_CLIENT] Success — data type: {}", type(data).__name__)
-
-                # Full response dump so we can evaluate what each endpoint actually returns
+                # Log parsed JSON
                 raw_json = json.dumps(data, indent=2, default=str)
-                logger.debug("[API_CLIENT] Full response ({} bytes):\n{}", len(raw_json),
+                logger.debug("[API_CLIENT]   Full response ({} bytes):\n{}",
+                             len(raw_json),
                              raw_json[:4000] + (" ... [truncated]" if len(raw_json) > 4000 else ""))
 
+                # Skip auth/session endpoints — they return tokens not HR data
+                if isinstance(data, dict):
+                    nested = data.get("result", data)
+                    if isinstance(nested, dict):
+                        auth_keys = {"access_token", "refresh_token", "token",
+                                     "jwt_expiry", "bearer_token"}
+                        found = auth_keys & nested.keys()
+                        if found:
+                            logger.warning("[API_CLIENT] Decision: response contains auth token keys {} "
+                                           "→ not HR data → removing from DB: {}", found, url)
+                            _delete_endpoint(ep["id"], url)
+                            continue
+                        else:
+                            logger.debug("[API_CLIENT] Decision: no auth keys found → response looks like data")
+
+                # Log what we got
+                if isinstance(data, dict):
+                    logger.info("[API_CLIENT]   Success — {} field(s): {}", len(data), list(data.keys()))
+                    _log_data_preview(data)
+                elif isinstance(data, list):
+                    logger.info("[API_CLIENT]   Success — list with {} item(s)", len(data))
+                else:
+                    logger.info("[API_CLIENT]   Success — data type: {}", type(data).__name__)
+
                 store.touch_endpoint(ep["id"])
+                logger.info("[API_CLIENT] Decision: endpoint {} succeeded → returning data", url)
                 return data
 
-            logger.warning("[API_CLIENT] Unexpected status {} from {}", resp.status_code, url)
+            logger.warning("[API_CLIENT] Decision: unexpected status {} → skipping endpoint: {}",
+                           resp.status_code, url)
 
         except AuthExpired:
             raise
         except Exception as e:
-            logger.warning("[API_CLIENT] Request failed for {}: {}", url, e)
+            logger.warning("[API_CLIENT] Decision: request failed ({}) → skip endpoint: {}", e, url)
             continue
 
-    logger.info("[API_CLIENT] All endpoints exhausted — no data returned")
+    logger.info("[API_CLIENT] Decision: all {} endpoints exhausted without valid data "
+                "→ returning None → will fall through to discoverer", len(endpoints))
     return None
 
 
@@ -149,11 +363,12 @@ def _delete_endpoint(endpoint_id: int, url: str) -> None:
 
 
 def _log_data_preview(data: dict) -> None:
-    """Log a condensed preview of the response data."""
+    """Log each field of the response dict (nested objects summarised)."""
     for k, v in data.items():
-        if isinstance(v, (dict, list)):
-            logger.debug("[API_CLIENT]   {} = [nested {} items]",
-                         k, len(v) if isinstance(v, list) else "object")
+        if isinstance(v, dict):
+            logger.debug("[API_CLIENT]   {} = {{object, {} keys: {}}}", k, len(v), list(v.keys()))
+        elif isinstance(v, list):
+            logger.debug("[API_CLIENT]   {} = [list, {} items]", k, len(v))
         else:
             logger.debug("[API_CLIENT]   {} = {!r}", k, v)
 
@@ -161,10 +376,9 @@ def _log_data_preview(data: dict) -> None:
 def format_answer(query: str, data: dict, config: dict | None = None) -> str:
     """
     Ask the LLM to format a natural-language answer from raw API JSON.
-    Uses OpenAI if configured (same provider as the rest of JARVIS), falls back
-    to Ollama, then to a plain key-value listing if both are unreachable.
+    Uses OpenAI if configured, falls back to Ollama, then plain text.
     """
-    logger.info("[API_CLIENT] Formatting answer via LLM | data keys: {}", list(data.keys()))
+    logger.info("[API_CLIENT] format_answer: query={!r} | data keys: {}", query, list(data.keys()))
 
     prompt = (
         f"The user asked: \"{query}\"\n\n"
@@ -173,11 +387,11 @@ def format_answer(query: str, data: dict, config: dict | None = None) -> str:
         "Use the exact values from the data. No markdown, no bullet points. "
         "Speak as if answering aloud to your boss."
     )
+    logger.debug("[API_CLIENT] LLM prompt:\n{}", prompt)
 
     # Try OpenAI first (already connected, higher quality)
     openai_key = (config or {}).get("llm", {}).get("openai_api_key", "")
     if not openai_key:
-        # Load from config.json directly if not passed in
         try:
             import json as _j
             from pathlib import Path
@@ -187,6 +401,7 @@ def format_answer(query: str, data: dict, config: dict | None = None) -> str:
             pass
 
     if openai_key:
+        logger.debug("[API_CLIENT] Decision: OpenAI key available → using gpt-4o-mini to format answer")
         try:
             import openai as _openai
             client = _openai.OpenAI(api_key=openai_key)
@@ -196,12 +411,13 @@ def format_answer(query: str, data: dict, config: dict | None = None) -> str:
                 max_tokens=120,
             )
             answer = response.choices[0].message.content.strip()
-            logger.info("[API_CLIENT] LLM answer (openai): {!r}", answer[:120])
+            logger.info("[API_CLIENT] LLM answer (openai): {!r}", answer)
             return answer
         except Exception as e:
-            logger.warning("[API_CLIENT] OpenAI format failed: {} — trying Ollama", e)
+            logger.warning("[API_CLIENT] Decision: OpenAI failed ({}) → falling back to Ollama", e)
+    else:
+        logger.debug("[API_CLIENT] Decision: no OpenAI key → trying Ollama")
 
-    # Fallback: Ollama
     try:
         import ollama
         client = ollama.Client(host="http://localhost:11434")
@@ -211,11 +427,13 @@ def format_answer(query: str, data: dict, config: dict | None = None) -> str:
             options={"num_predict": 120},
         )
         answer = response["message"]["content"].strip()
-        logger.info("[API_CLIENT] LLM answer (ollama): {!r}", answer[:120])
+        logger.info("[API_CLIENT] LLM answer (ollama): {!r}", answer)
         return answer
     except Exception as e:
-        logger.warning("[API_CLIENT] Ollama format failed: {} — using plain fallback", e)
+        logger.warning("[API_CLIENT] Decision: Ollama failed ({}) → using plain text fallback", e)
 
-    # Last resort: flat key-value dump (no nested objects)
+    # Last resort: flat key-value dump
     lines = [f"{k}: {v}" for k, v in data.items() if not isinstance(v, (dict, list))]
-    return ". ".join(lines) if lines else str(data)
+    fallback = ". ".join(lines) if lines else str(data)
+    logger.info("[API_CLIENT] Plain fallback answer: {!r}", fallback)
+    return fallback

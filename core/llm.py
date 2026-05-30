@@ -161,6 +161,10 @@ class LLMEngine:
                 messages.append({"role": msg["role"], "content": msg["content"]})
         messages.append({"role": "user", "content": text})
 
+        logger.debug("[ROUTE] Full request ({} messages):", len(messages))
+        for i, m in enumerate(messages):
+            logger.debug("[ROUTE]   [{}] role={} | {!r}", i, m["role"], m["content"][:300])
+
         try:
             raw = await self._chat(
                 self.fast_model,
@@ -235,6 +239,10 @@ class LLMEngine:
             f"[LLM] Provider: {self._provider} | Model: {model} | "
             f"Style: num_predict={num_predict} | History: {len(history) if history else 0} turns"
         )
+        logger.debug("[LLM] Full request ({} messages):", len(messages))
+        for i, m in enumerate(messages):
+            logger.debug("[LLM]   [{}] role={} | {!r}", i, m["role"], m["content"][:400])
+
         t0 = time.perf_counter()
 
         try:
@@ -245,4 +253,5 @@ class LLMEngine:
 
         elapsed = time.perf_counter() - t0
         logger.info(f"[LLM] Done in {elapsed:.1f}s | Response ({len(answer)} chars):\n{answer}")
+        logger.debug("[LLM] Full response:\n{}", answer)
         return answer

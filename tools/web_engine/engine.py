@@ -65,38 +65,67 @@ class WebEngine:
         self.narration.step("Let me look that up...")
 
         from tools.web_engine.discoverer import _extract_month_target
-        needs_fresh = _extract_month_target(query) is not None
+        month_target = _extract_month_target(query)
+        needs_fresh  = month_target is not None
+        if needs_fresh:
+            logger.debug("[ENGINE] Decision: needs_fresh=True (month={}) → skip cache, go straight to discoverer",
+                         month_target.strftime("%B %Y") if month_target else "?")
+        else:
+            logger.debug("[ENGINE] Decision: needs_fresh=False → will try API-first, then cache, then discoverer")
 
         # ── API-first path — direct httpx call, no browser ───────────────
         page_name = _query_to_page_name(site_id, query)
         if page_name:
+            logger.debug("[ENGINE] Decision: page_name={!r} resolved → attempting API-first path", page_name)
             try:
                 api_data = api_client.call_page(site_id, page_name, query)
                 if api_data:
+                    logger.debug("[ENGINE] Decision: API returned data → formatting answer, skip cache+discoverer")
                     answer = api_client.format_answer(query, api_data)
                     if answer:
                         logger.info("[ENGINE] API-first answer for page={!r}", page_name)
                         return answer
+                    else:
+                        logger.debug("[ENGINE] Decision: format_answer returned empty → falling through")
+                else:
+                    logger.debug("[ENGINE] Decision: API returned None (no endpoints or all failed) "
+                                 "→ falling through to cache/discoverer")
             except api_client.AuthExpired:
-                logger.info("[ENGINE] API auth expired — falling through to discoverer for re-login")
+                logger.info("[ENGINE] Decision: API raised AuthExpired → session needs refresh "
+                            "→ falling through to discoverer for re-login")
                 self.narration.step("The portal session has expired — let me refresh it.")
+        else:
+            logger.debug("[ENGINE] Decision: page_name=None for query {!r} → API-first path skipped", query)
 
         # ── ChromaDB cache — skip for time-specific queries ───────────────
         if not needs_fresh:
+            logger.debug("[ENGINE] Decision: needs_fresh=False → checking ChromaDB cache")
             answer = retriever.retrieve(query, site_id)
             if answer:
+                logger.debug("[ENGINE] Decision: cache HIT → returning cached answer, skip discoverer")
                 return answer
+            else:
+                logger.debug("[ENGINE] Decision: cache MISS → falling through to discoverer")
+        else:
+            logger.debug("[ENGINE] Decision: needs_fresh=True → skip cache entirely, must use discoverer")
 
         # ── Discovery — Playwright (first visit, cache miss, auth refresh) ─
-        logger.info("[ENGINE] Discovering for query: {!r}", query)
+        logger.info("[ENGINE] Decision: all fast paths exhausted → starting Playwright discovery")
         if not store.site_has_sections(site_id):
+            logger.info("[ENGINE] Decision: site_has_sections=False → first visit narration")
             self.narration.step("I haven't seen this before — let me find it.")
+        else:
+            logger.debug("[ENGINE] Decision: site_has_sections=True → site known, no first-visit narration")
+
         # For temporal follow-ups (needs_fresh), pass the last known page URL so
         # the discoverer starts directly on /my-activity (or /leave etc.) rather
         # than from the portal home page and failing to navigate there.
         start_url_hint = self._last_page_url.get(site_id) if needs_fresh else None
         if start_url_hint:
-            logger.info("[ENGINE] Passing last page URL hint to discoverer: {}", start_url_hint)
+            logger.info("[ENGINE] Decision: needs_fresh+last_page_url known → passing start_url={} to discoverer",
+                        start_url_hint)
+        elif needs_fresh:
+            logger.debug("[ENGINE] Decision: needs_fresh but no last_page_url cached → discoverer starts from base")
         answer, page_url = discoverer.discover(query, site_id, self.narration, start_url=start_url_hint)
         if page_url:
             self._last_page_url[site_id] = page_url
