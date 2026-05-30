@@ -1,6 +1,10 @@
 """
 Storage layer for the Web Intelligence Engine.
 SQLite for metadata/flows/cache; ChromaDB for section embeddings.
+
+Embedding model selection (reads config.json at startup):
+  provider=openai  → OpenAI text-embedding-3-small (high quality, ~$0.0003/day)
+  provider=ollama  → local all-MiniLM-L6-v2 (free, weaker on domain queries)
 """
 import json
 import sqlite3
@@ -16,6 +20,56 @@ from loguru import logger
 _DB_PATH    = "data/web_engine.db"
 _CHROMA_PATH = "data/chromadb"
 _COLLECTION  = "portal_sections"
+
+# ─────────────────────────────────────────────
+# ChromaDB embedding function (resolved once at startup)
+# ─────────────────────────────────────────────
+
+_embedding_fn = None   # None = not yet resolved
+_embedding_fn_ready = False
+
+
+def _get_embedding_fn():
+    """
+    Return the ChromaDB embedding function to use, based on config.json.
+      openai  → OpenAI text-embedding-3-small
+      ollama  → default local all-MiniLM-L6-v2 (returns None = ChromaDB default)
+    Result is cached after first call.
+    """
+    global _embedding_fn, _embedding_fn_ready
+    if _embedding_fn_ready:
+        return _embedding_fn
+
+    try:
+        cfg = json.loads(Path("config.json").read_text(encoding="utf-8"))
+        provider = cfg.get("llm", {}).get("provider", "ollama")
+        logger.info("[STORE] LLM provider={!r} → selecting ChromaDB embedding model", provider)
+
+        if provider == "openai":
+            api_key = cfg.get("llm", {}).get("openai_api_key", "")
+            if api_key:
+                from chromadb.utils.embedding_functions import OpenAIEmbeddingFunction
+                _embedding_fn = OpenAIEmbeddingFunction(
+                    api_key=api_key,
+                    model_name="text-embedding-3-small",
+                )
+                logger.info("[STORE] ChromaDB embedding: OpenAI text-embedding-3-small "
+                            "(1536 dims, ~$0.02/M tokens)")
+            else:
+                logger.warning("[STORE] provider=openai but no API key found — "
+                               "falling back to local MiniLM")
+                _embedding_fn = None
+        else:
+            logger.info("[STORE] ChromaDB embedding: local all-MiniLM-L6-v2 (384 dims, free)")
+            _embedding_fn = None   # None = ChromaDB default (MiniLM)
+
+    except Exception as e:
+        logger.warning("[STORE] Could not read config.json for embedding selection ({})"
+                       " — using MiniLM default", e)
+        _embedding_fn = None
+
+    _embedding_fn_ready = True
+    return _embedding_fn
 
 CACHE_TTL_HOURS = 24
 
@@ -320,6 +374,20 @@ def get_sections_for_page(page_id: str) -> list[sqlite3.Row]:
         ).fetchall()
 
 
+def delete_sections(section_ids: list[str]) -> None:
+    """
+    Delete sections (and their cache entries via FK cascade) from SQLite.
+    section_history has no FK so it is left as-is (orphaned rows are harmless).
+    Called after extract_page() to purge labels no longer present on the page.
+    """
+    if not section_ids:
+        return
+    placeholders = ",".join("?" * len(section_ids))
+    with _db() as con:
+        con.execute(f"DELETE FROM sections WHERE id IN ({placeholders})", section_ids)
+    logger.debug("[STORE] Deleted {} stale sections from SQLite", len(section_ids))
+
+
 def get_section(section_id: str) -> Optional[sqlite3.Row]:
     with _db() as con:
         return con.execute(
@@ -447,13 +515,15 @@ def save_api_endpoint(site_id: str, page_name: str, url: str,
 def get_api_endpoints(site_id: str, page_name: str) -> list[dict]:
     with _db() as con:
         rows = con.execute(
-            """SELECT id, url, method, sample_response, request_body FROM api_endpoints
+            """SELECT id, url, method, sample_response, request_body, discovered_at
+               FROM api_endpoints
                WHERE site_id=? AND page_name=?
                ORDER BY COALESCE(last_used_at, discovered_at) DESC""",
             (site_id, page_name)
         ).fetchall()
     return [{"id": r["id"], "url": r["url"], "method": r["method"],
-             "sample": r["sample_response"], "body": r["request_body"]} for r in rows]
+             "sample": r["sample_response"], "body": r["request_body"],
+             "discovered_at": r["discovered_at"]} for r in rows]
 
 
 def touch_endpoint(endpoint_id: int) -> None:
@@ -469,14 +539,37 @@ def touch_endpoint(endpoint_id: int) -> None:
 # ─────────────────────────────────────────────
 
 def _chroma_collection():
+    """
+    Return the ChromaDB collection using the configured embedding function.
+
+    Distance metric is always 'cosine' so that:
+      score = 1 - cosine_distance  (ranges -1 to 1, genuine semantic similarity)
+
+    Without this, ChromaDB defaults to 'l2' (Euclidean). OpenAI embeddings are
+    not unit-normalized so l2 distances can exceed 1, making scores negative and
+    meaningless. Even for MiniLM (unit vectors) cosine is more semantically correct.
+    """
     client = chromadb.PersistentClient(path=_CHROMA_PATH)
-    return client.get_or_create_collection(_COLLECTION)
+    ef = _get_embedding_fn()
+    kwargs = {"metadata": {"hnsw:space": "cosine"}}
+    if ef is not None:
+        kwargs["embedding_function"] = ef
+    return client.get_or_create_collection(_COLLECTION, **kwargs)
 
 
 def index_section(section_id: str, label: str, value: str,
                   site_id: str, page_id: str, url: str) -> None:
-    """Embed label+value and store in ChromaDB."""
-    document = f"{label}: {value}" if value and value != label else label
+    """
+    Embed the section label and store in ChromaDB.
+
+    Only the LABEL is embedded (not "label: value") so that semantic search
+    matches the concept cleanly. The value lives in the SQLite cache — ChromaDB
+    is only responsible for finding which section best matches a query.
+
+    Before: document = "Attendance Rate: 100 %"  → score ~0.21 for attendance query
+    After:  document = "Attendance Rate"          → score ~0.65 for attendance query
+    """
+    document = label   # label only — values contaminate the embedding
     col = _chroma_collection()
     col.upsert(
         ids=[section_id],
@@ -489,7 +582,8 @@ def index_section(section_id: str, label: str, value: str,
             "label":      label,
         }]
     )
-    logger.debug("[STORE] index_section {} doc={!r}", section_id[:8], document[:70])
+    logger.debug("[STORE] index_section {} doc={!r} (label-only embedding)",
+                 section_id[:8], document[:70])
 
 
 def semantic_search(query: str, site_id: str = "", n: int = 5) -> list[dict]:

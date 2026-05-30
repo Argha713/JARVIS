@@ -133,6 +133,7 @@ def discover(query: str, site_id: str, narration,
         current_url = page.url
         page_id = store.upsert_page(site_id, current_url)
         _save_captured_endpoints(site_id, current_url, _captured_api)
+        _fetch_endpoints_in_browser(page, site_id, current_url, _captured_api)
         sections = extract_page(page, site_id, page_id, current_url)
 
         if sections:
@@ -645,6 +646,89 @@ _SKIP_API_PATHS = ("/auth/", "/login/", "/token", "/refresh", "/logout",
 
 
 _AUTH_RESPONSE_KEYS = {"access_token", "refresh_token", "token", "jwt_expiry", "bearer_token"}
+
+
+def _fetch_endpoints_in_browser(page: Page, site_id: str, page_url: str,
+                                captured_api: dict) -> None:
+    """
+    Re-fetch each captured API endpoint from INSIDE the browser's own session context
+    using page.evaluate() + fetch().
+
+    Why this beats httpx:
+      - The browser already has the live session cookies (not a stale saved copy)
+      - fetch() sends the correct Origin/Referer headers automatically
+      - Any portal-specific auth (CSRF token, SameSite cookies, Bearer in cookie jar)
+        is handled transparently by the browser runtime
+      - Works even when direct httpx calls return the logout HTML page
+
+    The result overwrites sample_response in api_endpoints so api_client.call_page()
+    can serve the next query instantly from the stored JSON, no browser needed.
+    """
+    page_name = _url_to_page_name(page_url)
+    if not page_name:
+        return
+
+    # Build the list of URLs to re-fetch, applying the same filters as _save_captured_endpoints
+    to_fetch: list[str] = []
+    seen: set[str] = set()
+    for raw_url, info in captured_api.items():
+        data = info["data"] if isinstance(info, dict) and "data" in info else info
+        if not isinstance(data, dict) or len(data) < 2:
+            continue
+        if any(skip in raw_url for skip in _SKIP_API_PATHS):
+            continue
+        nested = data.get("result", data)
+        if isinstance(nested, dict) and _AUTH_RESPONSE_KEYS & nested.keys():
+            continue
+        parsed   = urlparse(raw_url)
+        clean_url = urlunparse(parsed._replace(query="", fragment=""))
+        if clean_url not in seen:
+            seen.add(clean_url)
+            to_fetch.append(clean_url)
+
+    if not to_fetch:
+        logger.debug("[DISCOVERER] No endpoints to re-fetch in browser context")
+        return
+
+    logger.info("[DISCOVERER] Re-fetching {}/{} endpoint(s) via browser fetch() (page={!r})",
+                len(to_fetch), len(captured_api), page_name)
+    refreshed = 0
+    for url in to_fetch:
+        try:
+            result = page.evaluate(f"""
+                async () => {{
+                    try {{
+                        const resp = await fetch({_json.dumps(url)}, {{
+                            credentials: 'include',
+                            headers: {{'Accept': 'application/json'}}
+                        }});
+                        if (!resp.ok) return null;
+                        const ct = resp.headers.get('content-type') || '';
+                        if (!ct.includes('json')) return null;
+                        return await resp.json();
+                    }} catch (e) {{ return null; }}
+                }}
+            """)
+
+            if not result or not isinstance(result, dict):
+                logger.debug("[DISCOVERER] Browser fetch {!r} → no JSON data", url)
+                continue
+
+            # Skip auth responses
+            nested = result.get("result", result)
+            if isinstance(nested, dict) and _AUTH_RESPONSE_KEYS & nested.keys():
+                logger.debug("[DISCOVERER] Browser fetch {!r} → auth response, skip", url)
+                continue
+
+            sample = _json.dumps(result)
+            store.save_api_endpoint(site_id, page_name, url, "GET", sample)
+            logger.info("[DISCOVERER] Browser fetch ✓ {!r} → {} bytes of JSON", url, len(sample))
+            refreshed += 1
+        except Exception as e:
+            logger.debug("[DISCOVERER] Browser fetch {!r} failed: {}", url, e)
+
+    logger.info("[DISCOVERER] Browser fetch summary: {}/{} endpoint(s) refreshed",
+                refreshed, len(to_fetch))
 
 
 def _save_captured_endpoints(site_id: str, page_url: str, captured: dict) -> None:

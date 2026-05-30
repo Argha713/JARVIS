@@ -14,9 +14,13 @@ from tools.web_engine.actions import navigate
 from tools.web_engine.extractor import extract_page, refresh_section
 
 # Minimum semantic similarity to trust a result (0–1).
-# 0.35 catches near-matches like "punctuality rate" ↔ "57.89 % Punctuality Rate"
-# without dropping to noisy territory.
-_MATCH_THRESHOLD = 0.35
+# With OpenAI text-embedding-3-small + label-only documents:
+#   genuine match (e.g. "attendance" ↔ "Attendance Rate") → ~0.60–0.75
+#   weak match → ~0.30–0.45
+#   unrelated → < 0.20
+# 0.25 gives headroom for noisy conversational queries while blocking garbage.
+# (Was 0.35, calibrated for MiniLM + label:value documents — no longer needed.)
+_MATCH_THRESHOLD = 0.25
 
 
 def retrieve(query: str, site_id: str) -> str | None:

@@ -3,10 +3,31 @@ Full-page extractor: runs a single JS evaluation on a Playwright page
 and returns all meaningful data sections as [{label, value, selector}].
 Also stores them in SQLite + ChromaDB.
 """
+import re
+
 from loguru import logger
 from playwright.sync_api import Page
 
 from tools.web_engine import store
+
+
+def _is_meaningful_label(label: str) -> bool:
+    """
+    Return True only if label is a real semantic label, not a raw extracted value.
+
+    Blocks:  '60', '60 %', '100', '20/20', '13:28', '28%', '0', '1', '3', '5',
+             '60%Punctuality Rate', '100 % Attendance Rate'  (value-prefixed)
+    Keeps:   'Punctuality Rate', 'Attendance Rate', 'Days Present',
+             'Avg. Hours Worked', 'Days Late Check In', 'Biometric Activity Today...'
+    """
+    label = label.strip()
+    if not label:
+        return False
+    # Must start with a letter — blocks value-prefixed labels like '60 % Punctuality Rate'
+    if not label[0].isalpha():
+        return False
+    # Must contain at least one word ≥ 3 alpha chars — blocks 'Av.', single-char labels
+    return bool(re.search(r'[A-Za-z]{3,}', label))
 
 _JS = """
 () => {
@@ -198,33 +219,46 @@ def extract_page(page: Page, site_id: str, page_id: str, url: str) -> list[dict]
             i + 1, item["label"][:45], item["value"][:60]
         )
 
-    # Persist
+    # Persist — only index sections with meaningful semantic labels (not raw values)
     new_labels: set[str] = set()
+    meaningful: list[dict] = []
     for item in sections:
         label    = item["label"]
         value    = item["value"]
         selector = item.get("selector", "")
-        new_labels.add(label)
 
+        if not _is_meaningful_label(label):
+            logger.debug("[EXTRACTOR] Skip noise label: {!r}", label[:50])
+            continue
+
+        new_labels.add(label)
+        meaningful.append(item)
         section_id = store.upsert_section(page_id, label, selector)
         store.index_section(section_id, label, value, site_id, page_id, url)
         logger.debug("[EXTRACTOR] Indexed  {} label={!r} value={!r}",
                      section_id[:8], label[:40], value[:40])
 
-    # Remove stale ChromaDB entries for sections no longer found on this page.
-    # This prevents old value-embedded labels (e.g. "57.89 % Punctuality Rate") from
-    # persisting in the index after the extractor learns the clean label ("Punctuality Rate").
+    noise_count = len(sections) - len(meaningful)
+
+    # Purge stale entries from BOTH ChromaDB and SQLite.
+    # SQLite accumulates rows across sessions; deleting them here keeps the DB clean
+    # and avoids stale labels interfering with future runs.
     existing = store.get_sections_for_page(page_id)
-    stale_removed = 0
+    stale_ids: list[str] = []
     for sec in existing:
         if sec["label"] not in new_labels:
             store.delete_section_embedding(sec["id"])
-            stale_removed += 1
-            logger.debug("[EXTRACTOR] Purged stale ChromaDB entry: {!r}", sec["label"][:60])
+            stale_ids.append(sec["id"])
+            logger.debug("[EXTRACTOR] Stale: {!r}", sec["label"][:60])
 
-    logger.info("[EXTRACTOR] Done — {} indexed, {} stale purged from ChromaDB",
-                len(sections), stale_removed)
-    return sections
+    if stale_ids:
+        store.delete_sections(stale_ids)
+
+    logger.info(
+        "[EXTRACTOR] Done — {} indexed ({} noise filtered), {} stale purged (ChromaDB + SQLite)",
+        len(meaningful), noise_count, len(stale_ids),
+    )
+    return meaningful  # callers only see meaningful sections — no noise cached
 
 
 def refresh_section(page: Page, section_id: str, selector: str, label: str) -> str | None:

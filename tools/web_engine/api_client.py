@@ -29,6 +29,10 @@ from tools.web_engine.discoverer import _extract_month_target
 _GET_ACCESS_DATA_URL = "https://hr.besimplified.com/api/server/getAccessData"
 _BEARER_TTL_SECONDS  = 12 * 3600   # re-fetch after 12h (server expiry is 14 days)
 
+# How long a browser-fetched sample_response is trusted before we require a fresh
+# Playwright run.  4 hours covers a full workday while still catching mid-day changes.
+_SAMPLE_TTL_SECONDS  = 4 * 3600
+
 # In-memory token cache: site_id → {"token": str, "fetched_at": float}
 _bearer_cache: dict[str, dict] = {}
 
@@ -132,6 +136,50 @@ def call_page(site_id: str, page_name: str, query: str) -> dict | None:
         logger.debug("[API_CLIENT]   Endpoint {}: method={} url={} body={}",
                      i, ep.get("method", "GET"), ep["url"],
                      "yes" if ep.get("body") else "none")
+
+    # ── Fast path: merge ALL browser-fetched sample_responses if fresh ──────────
+    # _fetch_endpoints_in_browser() stores fresh JSON from page.evaluate() fetch()
+    # for every endpoint. Different processRequest* endpoints serve different data
+    # (attendance stats, leave counts, request counts, etc.) — we must collect ALL
+    # of them and merge before passing to format_answer(), so the LLM can pick the
+    # value that actually answers the query (not just whatever endpoint happened first).
+    from datetime import datetime, timezone as _tz
+    merged: dict = {}
+    fresh_ids: list[int] = []
+    for ep in endpoints:
+        sample_json   = ep.get("sample")
+        discovered_at = ep.get("discovered_at")
+        if not sample_json or not discovered_at:
+            continue
+        try:
+            age = (datetime.now(_tz.utc) - datetime.fromisoformat(discovered_at)).total_seconds()
+        except Exception:
+            continue
+        if age > _SAMPLE_TTL_SECONDS:
+            logger.debug("[API_CLIENT] sample_response stale ({:.0f}s > {}s) for {}",
+                         age, _SAMPLE_TTL_SECONDS, ep["url"])
+            continue
+        try:
+            data = json.loads(sample_json)
+            if not data:
+                continue
+            # Merge: use endpoint URL tail as namespace key to avoid collisions
+            key = ep["url"].rstrip("/").rsplit("/", 1)[-1]  # e.g. "processRequest5"
+            merged[key] = data
+            fresh_ids.append(ep["id"])
+            logger.debug("[API_CLIENT] Fast path collected sample from {} (age={:.0f}s)",
+                         ep["url"], age)
+        except Exception as e:
+            logger.debug("[API_CLIENT] sample_response parse failed for {}: {}", ep["url"], e)
+
+    if merged:
+        logger.info("[API_CLIENT] Fast path ✓ — merged {} fresh endpoint(s), no browser needed",
+                    len(merged))
+        for ep_id in fresh_ids:
+            store.touch_endpoint(ep_id)
+        return merged
+
+    logger.debug("[API_CLIENT] No fresh sample_response → falling through to httpx")
 
     session = store.load_session(site_id)
     if not session:
