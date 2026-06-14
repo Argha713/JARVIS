@@ -181,6 +181,41 @@ def init_db() -> None:
             last_used_at    TEXT,
             UNIQUE(site_id, page_name, url)
         );
+
+        CREATE TABLE IF NOT EXISTS procedures (
+            id                   TEXT PRIMARY KEY,
+            name                 TEXT NOT NULL,
+            tool                 TEXT NOT NULL,
+            params_template      TEXT NOT NULL DEFAULT '{}',
+            created_at           TEXT NOT NULL,
+            last_used            TEXT,
+            success_count        INTEGER DEFAULT 0,
+            failure_count        INTEGER DEFAULT 0,
+            consecutive_failures INTEGER DEFAULT 0,
+            requires_variables   TEXT    DEFAULT '[]',
+            narration_start      TEXT    DEFAULT '',
+            narration_done       TEXT    DEFAULT '',
+            narration_error      TEXT    DEFAULT ''
+        );
+
+        CREATE TABLE IF NOT EXISTS procedure_steps (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            procedure_id TEXT    NOT NULL REFERENCES procedures(id) ON DELETE CASCADE,
+            step_order   INTEGER NOT NULL,
+            tool         TEXT    NOT NULL,
+            action       TEXT    NOT NULL,
+            params       TEXT    NOT NULL DEFAULT '{}',
+            narration    TEXT    DEFAULT '',
+            sensitive    INTEGER DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_procedure_steps_order
+            ON procedure_steps(procedure_id, step_order);
+
+        CREATE TABLE IF NOT EXISTS procedure_triggers (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            procedure_id TEXT NOT NULL REFERENCES procedures(id) ON DELETE CASCADE,
+            phrase       TEXT NOT NULL
+        );
         """)
     # Migrate existing DB: add request_body column if the table was created before this field
     try:
@@ -724,3 +759,6 @@ def format_with_history(section_id: str, current_value: str) -> str:
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+# Procedure CRUD → tools/web_engine/procedure_store.py
+# Schema (tables) is created here in init_db() — single init point for the whole DB.
