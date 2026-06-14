@@ -1,10 +1,11 @@
 """
-Procedure repository — SQLite CRUD for procedure memory (Phase 4).
+Procedure repository (DAL) — raw SQLite CRUD for procedure memory (Phase 4).
 
 Tables: procedures, procedure_steps, procedure_triggers
 Schema is created by store.init_db() on startup — this file only handles data access.
 
 In .NET terms: this is the IProcedureRepository implementation.
+The service layer (ProcedureService) lives in memory/procedure_service.py.
 Connection management and shared helpers come from store._db / store._now.
 """
 import json
@@ -214,6 +215,23 @@ def delete_procedure_steps_for(procedure_id: str) -> None:
         con.execute(
             "DELETE FROM procedure_steps WHERE procedure_id=?", (procedure_id,)
         )
+
+
+def update_procedure_core(procedure_id: str, tool: str, params_template: dict,
+                          requires_variables: list) -> None:
+    """
+    Update tool, params_template, requires_variables and reset consecutive_failures.
+    Called by ProcedureStore.overwrite() after re-recording steps for a correction.
+    """
+    with _db() as con:
+        con.execute("""
+            UPDATE procedures SET
+                tool                 = ?,
+                params_template      = ?,
+                requires_variables   = ?,
+                consecutive_failures = 0
+            WHERE id=?
+        """, (tool, json.dumps(params_template), json.dumps(requires_variables), procedure_id))
 
 
 def delete_procedure_triggers_for(procedure_id: str) -> None:
