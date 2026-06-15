@@ -16,6 +16,37 @@ _SWITCH_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Fast gate for procedure management — avoids LLM call on ordinary queries
+_MGMT_HINTS = frozenset([
+    "forget", "delete", "remove", "stop remembering", "don't remember",
+    "next time use", "next time do", "redo", "that was wrong",
+    "use different", "change how", "update how",
+])
+
+# EOD submission pattern — same as engine.py
+_EOD_RE = re.compile(
+    r"(?:submit|send|log|write|record)\s+(?:my\s+)?(?:eod|end[- ]of[- ]day|work journal)[:\s]+(.+)",
+    re.I,
+)
+
+
+def _derive_procedure_meta(user_input: str) -> tuple:
+    """
+    Returns (name, params_template, requires_variables) for a web query.
+
+    Called when auto-saving a procedure after first successful execution.
+    EOD queries get a variable placeholder for the daily task text.
+    All other queries are saved as-is with no variable substitution.
+    """
+    if _EOD_RE.search(user_input):
+        return (
+            "Submit EOD",
+            {"action": "query", "text": "submit my eod: {tasks_done}"},
+            ["tasks_done"],
+        )
+    name = re.sub(r"\s+", " ", user_input.strip())[:40].title().rstrip("?")
+    return (name, {"action": "query", "text": user_input}, [])
+
 
 class TaskRouter:
     def __init__(self, llm: LLMEngine, narration: Narration, tool_registry=None):
@@ -23,6 +54,24 @@ class TaskRouter:
         self.narration = narration
         self.tools = tool_registry
         self._history: list[dict] = []  # conversation memory for current session
+
+        # Phase 4: procedure memory — gracefully absent if modules not ready
+        self._proc_svc = None
+        self._matcher  = None
+        self._runner   = None
+        self._init_procedure_memory(tool_registry, narration)
+
+    def _init_procedure_memory(self, tool_registry, narration) -> None:
+        try:
+            from memory.procedure_service import ProcedureService
+            from memory.procedure_matcher import ProcedureMatcher
+            from core.procedure_runner import ProcedureRunner
+            self._proc_svc = ProcedureService()
+            self._matcher  = ProcedureMatcher()
+            self._runner   = ProcedureRunner(tool_registry, narration, self._proc_svc)
+            logger.info("[ROUTER] Phase 4 procedure memory enabled")
+        except Exception as e:
+            logger.warning("[ROUTER] Phase 4 not available (JARVIS works without it): {}", e)
 
     def _add_to_history(self, role: str, content: str) -> None:
         self._history.append({"role": role, "content": content})
@@ -154,6 +203,222 @@ class TaskRouter:
         logger.info(f"[SWITCH] Switched to {provider_label}")
         return f"Done. Switched to {provider_label}, sir. No restart needed."
 
+    # ──────────────────────────────────────────────────────────────────────────
+    # Phase 4: Procedure execution
+    # ──────────────────────────────────────────────────────────────────────────
+
+    async def _try_procedure(self, user_input: str) -> str | None:
+        """
+        Check if user_input matches a saved procedure and run it.
+
+        Returns a spoken response string if a procedure was matched (and run),
+        or None to signal fall-through to normal routing.
+        """
+        if not self._matcher or not self._runner:
+            return None
+
+        loop = asyncio.get_event_loop()
+        try:
+            match = await loop.run_in_executor(None, self._matcher.find, user_input)
+        except Exception as e:
+            logger.warning("[ROUTER] Procedure match error (falling through): {}", e)
+            return None
+
+        if match is None:
+            return None
+
+        # Two close matches — ask user to clarify
+        if match.get("ambiguous"):
+            candidates = match["candidates"]
+            names = " or ".join(f'"{c["name"]}"' for c in candidates[:2])
+            response = f"I found two matching saved tasks: {names}. Which one did you mean, sir?"
+            self._add_to_history("user", user_input)
+            self._add_to_history("assistant", response)
+            return response
+
+        procedure = match
+        logger.info("[ROUTER] Procedure match: '{}' id={}", procedure["name"], procedure["id"])
+
+        # Double-submit guard (e.g. EOD already submitted 10s ago)
+        if self._runner.would_double_submit(procedure):
+            response = (
+                f"I ran {procedure['name']} just a moment ago. "
+                "Did you want to run it again, sir?"
+            )
+            self._add_to_history("user", user_input)
+            self._add_to_history("assistant", response)
+            return response
+
+        # Extract variables from user speech if the procedure requires them
+        requires_vars = procedure.get("requires_variables", [])
+        resolved_vars = {}
+        if requires_vars:
+            try:
+                resolved_vars = await self.llm.extract_variables(requires_vars, user_input)
+                logger.info("[ROUTER] Extracted vars: {}", resolved_vars)
+            except Exception as e:
+                logger.warning("[ROUTER] Variable extraction failed (proceeding without): {}", e)
+
+        # Run the procedure
+        from core.procedure_runner import ProcedureExecutionError
+        try:
+            result = await loop.run_in_executor(
+                None, self._runner.run, procedure, resolved_vars
+            )
+        except ProcedureExecutionError as e:
+            logger.error("[ROUTER] Procedure '{}' failed: {}", procedure["name"], e)
+            error_narr = procedure.get("narration_error", "")
+            if not error_narr:
+                self.narration.step("Something went wrong.")
+            response = (
+                f"I ran into a problem with {procedure['name']}. "
+                "Let me try another way, sir."
+            )
+            self._add_to_history("user", user_input)
+            self._add_to_history("assistant", response)
+            return response
+
+        # PASSTHROUGH: procedure broken — delete it so next query re-learns
+        if str(result).startswith(_PASSTHROUGH_PREFIX):
+            try:
+                await loop.run_in_executor(None, self._proc_svc.delete, procedure["id"])
+                logger.info("[ROUTER] Deleted broken procedure '{}' id={}",
+                            procedure["name"], procedure["id"])
+            except Exception as del_e:
+                logger.warning("[ROUTER] Could not delete broken procedure: {}", del_e)
+            response = str(result)[len(_PASSTHROUGH_PREFIX):]
+            self._add_to_history("user", user_input)
+            self._add_to_history("assistant", response)
+            return response
+
+        # Summarize the result for spoken output
+        summary_prompt = (
+            f"The user asked: {user_input}\n"
+            f"Result: {result}\n"
+            "In 1-2 spoken sentences (max 40 words), state the key finding. "
+            "Quote exact numbers and percentages as given."
+        )
+        response = await self.llm.ask(
+            summary_prompt,
+            model=self.llm.fast_model,
+            style={"num_predict": 100, "length_hint": "Summarise in 1-2 spoken sentences."},
+        )
+        self._add_to_history("user", user_input)
+        self._add_to_history("assistant", response)
+        return response
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Phase 4: Forget / correct commands
+    # ──────────────────────────────────────────────────────────────────────────
+
+    async def _try_procedure_management(self, user_input: str) -> str | None:
+        """
+        Handle 'forget X' and 'correct X' voice commands.
+
+        Uses a keyword gate first so we don't call the LLM on every query.
+        Returns a spoken response if a management command was detected, else None.
+        """
+        if not self._proc_svc:
+            return None
+
+        u_lower = user_input.lower()
+        if not any(hint in u_lower for hint in _MGMT_HINTS):
+            return None
+
+        try:
+            intent_result = await self.llm.detect_correction_intent(user_input)
+            intent = intent_result.get("intent", "none")
+        except Exception as e:
+            logger.debug("[ROUTER] detect_correction_intent failed: {}", e)
+            return None
+
+        if intent == "forget":
+            all_procs = self._proc_svc.list_all()
+            target = None
+            for p in all_procs:
+                if p["name"].lower() in u_lower:
+                    target = p
+                    break
+
+            if target:
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(None, self._proc_svc.delete, target["id"])
+                logger.info("[ROUTER] User deleted procedure '{}' id={}", target["name"], target["id"])
+                response = f"Done. I've forgotten how to {target['name'].lower()}, sir."
+            else:
+                response = (
+                    "I don't have a saved procedure with that name. "
+                    "Which one did you mean, sir?"
+                )
+            self._add_to_history("user", user_input)
+            self._add_to_history("assistant", response)
+            return response
+
+        if intent == "correct":
+            response = "Understood, sir. Please show me the correct way and I'll learn it from scratch."
+            self._add_to_history("user", user_input)
+            self._add_to_history("assistant", response)
+            return response
+
+        return None
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Phase 4: Auto-save a procedure after first-time execution
+    # ──────────────────────────────────────────────────────────────────────────
+
+    async def _auto_save_procedure(self, user_input: str, recorder) -> None:
+        """
+        After a web tool execution that was recorded, save the steps as a procedure
+        so future identical queries can be replayed without LLM routing.
+
+        Only saves if:
+        - recorder captured at least one step (Playwright/form path — not API/cache)
+        - no procedure with the same name already exists
+        """
+        if not self._proc_svc or recorder.step_count() == 0:
+            return
+
+        name, params_template, requires_variables = _derive_procedure_meta(user_input)
+
+        # Don't save a duplicate
+        existing = self._proc_svc.find_by_name(name)
+        if existing:
+            logger.debug("[ROUTER] Procedure '{}' already saved — skipping", name)
+            return
+
+        steps = recorder.commit()
+
+        description = f"Handles the request: {user_input[:80]}"
+        try:
+            triggers = await self.llm.generate_procedure_triggers(name, description)
+        except Exception as e:
+            logger.warning("[ROUTER] Trigger generation failed (using fallback): {}", e)
+            triggers = [user_input.lower().strip()]
+
+        narration_cfg = {
+            "start": f"Running {name}...",
+            "done":  "Done.",
+            "error": "Something went wrong.",
+        }
+        try:
+            proc_id = self._proc_svc.save(
+                name=name,
+                tool="web",
+                params_template=params_template,
+                triggers=triggers,
+                steps=steps,
+                requires_variables=requires_variables,
+                narration=narration_cfg,
+            )
+            logger.info("[ROUTER] Saved procedure '{}' id={} triggers={}", name, proc_id, len(triggers))
+            self.narration.step("I've learned how to do that. I'll remember it for next time, sir.")
+        except Exception as e:
+            logger.error("[ROUTER] Failed to save procedure '{}': {}", name, e)
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Main dispatch
+    # ──────────────────────────────────────────────────────────────────────────
+
     async def handle(self, user_input: str) -> str:
         if not user_input.strip():
             return "I didn't catch that. Could you say that again?"
@@ -168,6 +433,16 @@ class TaskRouter:
         logger.info(f"[ROUTER] ── New request ──────────────────────")
         logger.info(f"[ROUTER] User said: {user_input!r}")
         logger.info(f"[ROUTER] History: {len(self._history)} messages in context")
+
+        # Phase 4: procedure match FIRST — before keyword routing and LLM
+        proc_response = await self._try_procedure(user_input)
+        if proc_response is not None:
+            return proc_response
+
+        # Phase 4: forget / correct commands
+        mgmt_response = await self._try_procedure_management(user_input)
+        if mgmt_response is not None:
+            return mgmt_response
 
         # Step 1: Route decision — fast pre-router first, then LLM fallback
         t_route = time.perf_counter()
@@ -189,6 +464,19 @@ class TaskRouter:
             # Always use the original user text for the web tool — LLM paraphrases break tag matching
             if tool_name == "web":
                 params["text"] = user_input
+
+            # Phase 4: inject recorder into web calls so steps can be learned
+            _recorder = None
+            if tool_name == "web" and self._proc_svc:
+                try:
+                    from memory.procedure_recorder import ProcedureRecorder
+                    _recorder = ProcedureRecorder()
+                    name_hint = _derive_procedure_meta(user_input)[0]
+                    _recorder.begin(name_hint=name_hint)
+                    params["_recorder"] = _recorder
+                except Exception as e:
+                    logger.debug("[ROUTER] Could not create recorder: {}", e)
+
             logger.info(f"[ROUTER] Dispatching tool: {tool_name} | params: {params}")
             self.narration.step(f"Using {tool_name.replace('_', ' ')}...")
 
@@ -203,6 +491,13 @@ class TaskRouter:
                 self._add_to_history("user", user_input)
                 self._add_to_history("assistant", response)
                 return response
+
+            # Phase 4: auto-save procedure from recorder steps (non-blocking best-effort)
+            if _recorder:
+                try:
+                    await self._auto_save_procedure(user_input, _recorder)
+                except Exception as e:
+                    logger.warning("[ROUTER] Auto-save procedure failed (non-fatal): {}", e)
 
             summary_prompt = (
                 f"The user asked: {user_input}\n"
