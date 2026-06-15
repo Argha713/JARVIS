@@ -1,3 +1,10 @@
+# DEPRECATED — Do not add new features here.
+#
+# All portal queries now go through tools/web_engine/ (WebEngine).
+# Pipeline: keyword resolver -> API-first (httpx) -> ChromaDB cache -> Playwright discoverer.
+# Session management has moved to web_engine.db (sites.session_data column).
+# This file is kept as reference only and is NOT registered in tools/registry.py.
+
 """
 Portal tool — reads and interacts with people.codeclouds.com.
 Uses a saved Playwright session (data/portal_session.json).
