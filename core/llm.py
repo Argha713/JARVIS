@@ -218,6 +218,125 @@ class LLMEngine:
             logger.warning(f"[ROUTE] Parse failed ({e}) — fallback to answer. Raw: {raw!r}")
             return {"tool": "answer"}
 
+    async def extract_variables(self, requires_variables: list, user_input: str) -> dict:
+        """
+        Extract values for required procedure variables from the user's speech.
+
+        requires_variables: ["tasks_done", "date"]
+        user_input: "submit my eod: fixed login bug and reviewed PRs"
+
+        Returns: {"tasks_done": "fixed login bug and reviewed PRs"}
+        Missing or ambiguous variables are omitted from the result — the caller
+        must handle and ask the user to clarify.
+        """
+        if not requires_variables:
+            return {}
+
+        var_list = ", ".join(f'"{v}"' for v in requires_variables)
+        prompt = (
+            f"Extract the following values from the user's input. "
+            f"Variables to extract: [{var_list}].\n"
+            f"User said: \"{user_input}\"\n\n"
+            f"Return a JSON object mapping each variable name to its extracted value. "
+            f"Omit any variable you cannot confidently extract. "
+            f"Return the raw JSON object only — no explanation, no markdown."
+        )
+        try:
+            raw = await self._chat(
+                self.fast_model,
+                [{"role": "user", "content": prompt}],
+                num_predict=200,
+            )
+            raw = raw.strip()
+            if "```" in raw:
+                raw = raw.split("```")[1].lstrip("json").strip().rstrip("```").strip()
+            start, end = raw.find("{"), raw.rfind("}")
+            if start != -1 and end != -1:
+                raw = raw[start:end + 1]
+            result = json.loads(raw)
+            return {k: str(v) for k, v in result.items() if k in requires_variables}
+        except Exception as e:
+            logger.warning("[LLM] extract_variables failed: {}", e)
+            return {}
+
+    async def generate_procedure_triggers(self, procedure_name: str, description: str) -> list:
+        """
+        Generate 5–8 natural language trigger phrases for a procedure.
+        These are stored in ChromaDB and matched semantically against future voice input.
+
+        Returns: ["submit my eod", "send my work report", "log daily tasks", ...]
+        Falls back to [procedure_name.lower()] on failure.
+        """
+        prompt = (
+            f"Generate 5 to 8 short, natural language voice command phrases that a user might "
+            f"say to trigger the following task.\n"
+            f"Task name: \"{procedure_name}\"\n"
+            f"Description: \"{description}\"\n\n"
+            f"Rules:\n"
+            f"- Each phrase should be what a person would actually say aloud\n"
+            f"- Vary phrasing (synonyms, different word orders)\n"
+            f"- All lowercase, no punctuation\n"
+            f"- Return a JSON array of strings only — no explanation, no markdown"
+        )
+        try:
+            raw = await self._chat(
+                self.fast_model,
+                [{"role": "user", "content": prompt}],
+                num_predict=200,
+            )
+            raw = raw.strip()
+            if "```" in raw:
+                raw = raw.split("```")[1].lstrip("json").strip().rstrip("```").strip()
+            start, end = raw.find("["), raw.rfind("]")
+            if start != -1 and end != -1:
+                raw = raw[start:end + 1]
+            phrases = json.loads(raw)
+            if isinstance(phrases, list) and all(isinstance(p, str) for p in phrases):
+                return [p.strip().lower() for p in phrases if p.strip()]
+        except Exception as e:
+            logger.warning("[LLM] generate_procedure_triggers failed: {}", e)
+        return [procedure_name.lower()]
+
+    async def detect_correction_intent(self, user_input: str) -> dict:
+        """
+        Classify whether the user is:
+        - correcting a procedure  ("use a different site next time", "that's wrong, redo it")
+        - asking to forget/delete a procedure  ("forget how to submit eod", "delete that procedure")
+        - neither  (normal request)
+
+        Returns: {"intent": "correct"} | {"intent": "forget"} | {"intent": "none"}
+        """
+        prompt = (
+            f"Classify the user's intent. They may be:\n"
+            f"  \"correct\" — correcting how JARVIS performed a saved task "
+            f"(e.g. \"use accuweather next time\", \"that was wrong\", \"redo it differently\")\n"
+            f"  \"forget\"  — asking JARVIS to forget/delete a saved procedure "
+            f"(e.g. \"forget how to submit eod\", \"delete that task\", \"stop remembering that\")\n"
+            f"  \"none\"    — neither of the above\n\n"
+            f"User said: \"{user_input}\"\n\n"
+            f"Return exactly one JSON object: {{\"intent\": \"correct\"}} or "
+            f"{{\"intent\": \"forget\"}} or {{\"intent\": \"none\"}}. "
+            f"No explanation, no markdown."
+        )
+        try:
+            raw = await self._chat(
+                self.fast_model,
+                [{"role": "user", "content": prompt}],
+                num_predict=20,
+            )
+            raw = raw.strip()
+            start, end = raw.find("{"), raw.rfind("}")
+            if start != -1 and end != -1:
+                raw = raw[start:end + 1]
+            result = json.loads(raw)
+            intent = result.get("intent", "none")
+            if intent not in ("correct", "forget", "none"):
+                intent = "none"
+            return {"intent": intent}
+        except Exception as e:
+            logger.warning("[LLM] detect_correction_intent failed: {}", e)
+            return {"intent": "none"}
+
     async def ask(self, prompt: str, model: str = None, history: list = None,
                   style: dict = None) -> str:
         if model is None:
