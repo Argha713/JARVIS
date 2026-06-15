@@ -37,12 +37,15 @@ _AUTO_NAV_THRESHOLD = 0.35
 
 
 def discover(query: str, site_id: str, narration,
-             start_url: str | None = None) -> tuple[str | None, str | None]:
+             start_url: str | None = None,
+             recorder=None) -> tuple[str | None, str | None]:
     """
     Foreground guided discovery.
     Opens visible browser, finds data, returns (answer, page_url) or (None, None).
     start_url: if provided, go there directly — skips home-page navigation logic.
                Used by temporal follow-ups so they land on /my-activity (not home).
+    recorder:  optional ProcedureRecorder — if provided, logs the navigation step
+               so TaskRouter can save this discovery as a procedure.
     """
     site = store.get_site(site_id)
     if not site:
@@ -172,6 +175,13 @@ def discover(query: str, site_id: str, narration,
                     else:
                         answer = best["document"]
                     logger.info("[DISCOVERER] Answer → {!r}", answer[:120])
+                    if recorder and answer:
+                        recorder.step(
+                            "web", "navigate_and_read",
+                            {"url": current_url, "query": query},
+                            narration="Opened portal page and read the data",
+                        )
+                        recorder.checkpoint()
         else:
             logger.warning("[DISCOVERER] No sections extracted from {!r}", current_url)
 

@@ -28,6 +28,11 @@ class WebEngine:
         _seed_portal(config)
 
     def run(self, params: dict) -> str:
+        # Recorder is injected by TaskRouter during first-time execution so
+        # WebEngine steps can be captured for procedure memory. Optional — when
+        # None, nothing related to procedure recording changes.
+        recorder = params.get("_recorder")
+
         # ── Pending confirmation ─────────────────────────────────────────
         if params.get("action") == "confirm_pending":
             if self._pending_query:
@@ -59,7 +64,7 @@ class WebEngine:
 
         # ── Write intent ────────────────────────────────────────────────────
         if intent == "write":
-            return self._handle_write(site_id, query)
+            return self._handle_write(site_id, query, recorder)
 
         # ── Read intent ─────────────────────────────────────────────────────
         self.narration.step("Let me look that up...")
@@ -126,7 +131,8 @@ class WebEngine:
                         start_url_hint)
         elif needs_fresh:
             logger.debug("[ENGINE] Decision: needs_fresh but no last_page_url cached → discoverer starts from base")
-        answer, page_url = discoverer.discover(query, site_id, self.narration, start_url=start_url_hint)
+        answer, page_url = discoverer.discover(query, site_id, self.narration,
+                                               start_url=start_url_hint, recorder=recorder)
         if page_url:
             self._last_page_url[site_id] = page_url
         if answer == _PORTAL_TIMEOUT:
@@ -181,7 +187,7 @@ class WebEngine:
     # Write operations
     # ──────────────────────────────────────────────
 
-    def _handle_write(self, site_id: str, query: str) -> str:
+    def _handle_write(self, site_id: str, query: str, recorder=None) -> str:
         # Detect EOD submission
         eod_match = re.search(
             r"(?:submit|send|log|write|record)\s+(?:my\s+)?(?:eod|end[- ]of[- ]day|work journal)[:\s]+(.+)",
@@ -190,7 +196,7 @@ class WebEngine:
         if eod_match:
             text = eod_match.group(1).strip()
             self.narration.step("Opening work journal...")
-            return form_submit.run(site_id, "form_submit_eod", {"text": text})
+            return form_submit.run(site_id, "form_submit_eod", {"text": text}, recorder=recorder)
 
         # Generic: open visible browser for user to interact
         site = store.get_site(site_id)

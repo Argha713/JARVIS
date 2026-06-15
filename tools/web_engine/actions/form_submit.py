@@ -18,11 +18,14 @@ from tools.web_engine.actions.navigate import open_page, close_page
 _DEFAULT_WAIT_MS = 2_000
 
 
-def run(site_id: str, action_type: str, substitutions: dict) -> str:
+def run(site_id: str, action_type: str, substitutions: dict, recorder=None) -> str:
     """
     Loads the action config for site_id+action_type, opens a visible browser,
     fills fields (replacing {key} placeholders with substitutions), submits.
     Returns a result string.
+
+    recorder: optional ProcedureRecorder — if provided, logs the navigation and
+              submit step so TaskRouter can save this action as a procedure.
     """
     config = store.get_action(site_id, action_type)
     if not config:
@@ -31,6 +34,9 @@ def run(site_id: str, action_type: str, substitutions: dict) -> str:
     site = store.get_site(site_id)
     base_url = site["base_url"] if site else f"https://{site_id}"
     url = base_url.rstrip("/") + "/" + config["url"].lstrip("/")
+
+    if recorder:
+        recorder.step("web", "navigate", {"url": url}, narration=f"Opening {url}")
 
     result = open_page(site_id, url, headless=False)
     if not result:
@@ -67,6 +73,12 @@ def run(site_id: str, action_type: str, substitutions: dict) -> str:
                 submit.click()
                 page.wait_for_timeout(_DEFAULT_WAIT_MS)
                 logger.info("[FORM] Form submitted via {!r}", submit_sel)
+                if recorder:
+                    recorder.step(
+                        "web", action_type, substitutions,
+                        narration="Filled and submitted the form",
+                    )
+                    recorder.checkpoint()
                 preview = substitutions.get("text", "")
                 preview = preview[:60] + "..." if len(preview) > 60 else preview
                 return f'Done. Submitted: "{preview}"'
