@@ -8,8 +8,10 @@ from openwakeword.model import Model
 from faster_whisper import WhisperModel
 from loguru import logger
 
-NATIVE_RATE = 48000   # WDM-KS device native rate
-TARGET_RATE = 16000   # rate expected by Whisper and openwakeword
+# WDM-KS device native rate - my laptop's Realtek driver is 48kHz, so this is the most common case
+NATIVE_RATE = 48000   
+# rate expected by Whisper and openwakeword - we resample from the native rate in Python to avoid driver issues with 16kHz subdevices
+TARGET_RATE = 16000   
 
 _WDM_KS_DEVICE: int | None = -1   # -1 = not yet probed; None = no device found
 

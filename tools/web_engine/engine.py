@@ -22,6 +22,10 @@ class WebEngine:
         self.narration = narration
         self._pending_query: tuple[str, str] | None = None  # (query, site_id) waiting for user confirmation
         self._last_page_url: dict[str, str] = {}  # site_id → last discovered page URL, used for temporal follow-ups
+        # Phase 5.5: multi-turn site onboarding state
+        self._pending_site_query: str | None = None       # set while waiting for user to give a URL
+        self._pending_alias_site_id: str | None = None    # set while waiting for user to give aliases
+        self._original_query_after_teach: str | None = None  # original query to re-run after site is taught
         store.init_db()
         # Validator uses sync Playwright — must run in a thread, not in the asyncio loop
         threading.Thread(target=validator.run_if_due, daemon=True).start()
@@ -48,6 +52,13 @@ class WebEngine:
             return "I didn't catch what you wanted to find. Could you say that again?"
 
         logger.info("[ENGINE] Query: {!r}", query)
+
+        # ── Phase 5.5: special action dispatch ──────────────────────────────
+        action = params.get("action")
+        if action == "teach_tag":         return self._handle_teach_tag(query)
+        if action == "refresh_knowledge": return self._handle_refresh_knowledge()
+        if action == "teach_site":        return self._handle_teach_site(query)
+        if action == "add_aliases":       return self._handle_add_aliases(query)
 
         # ── Resolve site ────────────────────────────────────────────────────
         # Accept a caller-provided site_id for temporal follow-ups whose text
@@ -156,18 +167,109 @@ class WebEngine:
 
     def _ask_for_site(self, query: str) -> str:
         """
-        JARVIS doesn't know which site to use.
-        Returns a question for the user; the response is handled by the next
-        command cycle (the task_router sees it as a follow-up).
-        For now, return a prompt and store the pending context.
+        JARVIS doesn't know which site to use. Sets pending state so the next
+        turn (user provides URL) is correctly routed via task_router._pre_route().
         """
         auto_tags = resolver.extract_tags_from_query(query)
         logger.info("[ENGINE] Unknown site for query {!r} — asking user", query)
         tag_hint = f" ({', '.join(auto_tags)})" if auto_tags else ""
+        self._pending_site_query = query
+        self._original_query_after_teach = query
         return (
-            f"I don't know which website{tag_hint} has that information. "
-            f"Could you give me the URL?"
+            f"{_PASSTHROUGH}I don't know which website{tag_hint} has that information. "
+            f"Could you give me the URL, sir?"
         )
+
+    # ──────────────────────────────────────────────
+    # Phase 5.5: special action handlers
+    # ──────────────────────────────────────────────
+
+    def _handle_teach_tag(self, user_input: str) -> str:
+        """Handle 'when I say X, I mean Y' — adds tag alias for a known site."""
+        m = re.search(
+            r"when\s+i\s+say\s+['\"]?(.+?)['\"]?,?\s+i\s+mean\s+(.+)",
+            user_input, re.I
+        )
+        if not m:
+            return (
+                f"{_PASSTHROUGH}I didn't quite understand that, sir. "
+                f"Try: 'when I say X, I mean Y'."
+            )
+        new_alias = m.group(1).strip().lower()
+        site_ref  = m.group(2).strip()
+        site_id, _ = resolver.resolve(site_ref)
+        if site_id:
+            store.add_tag(site_id, new_alias)
+            logger.info("[ENGINE] Tag taught: {!r} → {}", new_alias, site_id)
+            return f"{_PASSTHROUGH}Got it, sir. I'll recognise '{new_alias}' as {site_id} from now on."
+        return (
+            f"{_PASSTHROUGH}I don't know '{site_ref}' yet, sir. "
+            f"Tell me its URL first and I'll remember the alias."
+        )
+
+    def _handle_refresh_knowledge(self) -> str:
+        """Handle 'refresh portal knowledge' — runs validator in background."""
+        threading.Thread(
+            target=validator.run_full,
+            args=(self.narration,),
+            daemon=True,
+        ).start()
+        logger.info("[ENGINE] Manual portal knowledge refresh triggered")
+        return f"{_PASSTHROUGH}I'll update everything in the background, sir."
+
+    def _handle_teach_site(self, url_input: str) -> str:
+        """Handle user's URL reply after JARVIS asked 'Could you give me the URL?'"""
+        original_query = self._pending_site_query
+        self._pending_site_query = None
+
+        url_m = re.search(
+            r'(https?://\S+|(?:www\.)?[\w][\w.-]+\.(?:com|org|net|io|in|co\.in)(?:/\S*)?)',
+            url_input, re.I
+        )
+        if not url_m:
+            self._pending_site_query = original_query  # restore so user can try again
+            return f"{_PASSTHROUGH}I couldn't find a URL in that. Could you say it again, sir?"
+
+        raw_url = url_m.group(1)
+        auto_tags = resolver.extract_tags_from_query(original_query or url_input)
+        site_response = self.teach_site(raw_url, auto_tags)
+
+        # Derive site_id from the URL we just registered
+        base_url = raw_url if raw_url.startswith("http") else f"https://{raw_url}"
+        self._pending_alias_site_id = base_url.replace("https://", "").replace("http://", "").rstrip("/")
+
+        return f"{_PASSTHROUGH}{site_response}"
+
+    _NO_ALIAS = frozenset(["no", "nothing", "none", "nope", "skip", "done",
+                            "that's fine", "that's ok", "no thanks", "nevermind"])
+
+    def _handle_add_aliases(self, alias_input: str) -> str:
+        """Handle user's alias list reply after JARVIS asked 'Any other names for it?'"""
+        site_id        = self._pending_alias_site_id
+        original_query = self._original_query_after_teach
+        self._pending_alias_site_id    = None
+        self._original_query_after_teach = None
+
+        # User declined to add aliases
+        clean = alias_input.lower().strip().rstrip('.!?')
+        if clean in self._NO_ALIAS or len(clean) < 2:
+            if original_query:
+                return self.run({"action": "query", "text": original_query})
+            return f"{_PASSTHROUGH}Got it, sir."
+
+        parts   = re.split(r'[,\n]+|\band\b', alias_input, flags=re.I)
+        aliases = [p.strip().lower() for p in parts if p.strip() and len(p.strip()) > 1]
+        for alias in aliases:
+            store.add_tag(site_id, alias)
+            logger.info("[ENGINE] Alias added: {!r} → {}", alias, site_id)
+
+        alias_str = ", ".join(f"'{a}'" for a in aliases)
+
+        if original_query:
+            logger.info("[ENGINE] Re-running original query after site teach: {!r}", original_query)
+            return self.run({"action": "query", "text": original_query})
+
+        return f"{_PASSTHROUGH}Got it, sir. I'll also recognise {alias_str} as {site_id}."
 
     def teach_site(self, url: str, tags: list[str], name: str = "") -> str:
         """

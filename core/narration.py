@@ -1,16 +1,5 @@
 import asyncio
-import random
 from loguru import logger
-
-ACKNOWLEDGE_PHRASES = [
-    "Sure, on it.",
-    "Got it.",
-    "Let me check that.",
-    "On it, sir.",
-    "Right away.",
-    "Give me a moment.",
-    "Sure thing.",
-]
 
 
 class Narration:
@@ -32,8 +21,8 @@ class Narration:
         else:
             self.queue.put_nowait(message)
 
-    def acknowledge(self) -> None:
-        self.say(random.choice(ACKNOWLEDGE_PHRASES))
+    def acknowledge(self, phrase: str = "On it.") -> None:
+        self.say(phrase)
 
     def thinking(self) -> None:
         self.say("Let me think about that...")

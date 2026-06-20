@@ -216,6 +216,27 @@ def init_db() -> None:
             procedure_id TEXT NOT NULL REFERENCES procedures(id) ON DELETE CASCADE,
             phrase       TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS personality_phrases (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            category   TEXT    NOT NULL,
+            phrase     TEXT    NOT NULL,
+            is_seed    INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT    NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(category, phrase)
+        );
+        CREATE INDEX IF NOT EXISTS idx_personality_cat ON personality_phrases(category);
+
+        CREATE TABLE IF NOT EXISTS personality_refresh (
+            category       TEXT PRIMARY KEY,
+            last_refreshed TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS whisper_hallucinations (
+            phrase   TEXT PRIMARY KEY,
+            is_seed  INTEGER NOT NULL DEFAULT 0,
+            added_at TEXT    NOT NULL DEFAULT (datetime('now'))
+        );
         """)
     # Migrate existing DB: add request_body column if the table was created before this field
     try:
@@ -762,3 +783,72 @@ def _now() -> str:
 
 # Procedure CRUD → tools/web_engine/procedure_store.py
 # Schema (tables) is created here in init_db() — single init point for the whole DB.
+
+
+# ─────────────────────────────────────────────
+# Personality phrases
+# ─────────────────────────────────────────────
+
+def seed_personality_phrase(category: str, phrase: str) -> None:
+    with _db() as con:
+        con.execute(
+            "INSERT OR IGNORE INTO personality_phrases (category, phrase, is_seed) VALUES (?,?,1)",
+            (category, phrase),
+        )
+    with _db() as con:
+        con.execute(
+            "INSERT OR IGNORE INTO personality_refresh (category) VALUES (?)", (category,)
+        )
+
+
+def get_personality_phrases(category: str) -> list:
+    with _db() as con:
+        rows = con.execute(
+            "SELECT phrase FROM personality_phrases WHERE category=?", (category,)
+        ).fetchall()
+    return [r["phrase"] for r in rows]
+
+
+def get_personality_last_refreshed(category: str):
+    with _db() as con:
+        row = con.execute(
+            "SELECT last_refreshed FROM personality_refresh WHERE category=?", (category,)
+        ).fetchone()
+    return row["last_refreshed"] if row else None
+
+
+def replace_llm_personality_phrases(category: str, phrases: list) -> None:
+    """Atomic swap: delete old LLM phrases, insert new ones. Seeds are untouched."""
+    with _db() as con:
+        con.execute(
+            "DELETE FROM personality_phrases WHERE category=? AND is_seed=0", (category,)
+        )
+        con.executemany(
+            "INSERT OR IGNORE INTO personality_phrases (category, phrase, is_seed) VALUES (?,?,0)",
+            [(category, p) for p in phrases],
+        )
+
+
+def mark_personality_refreshed(category: str) -> None:
+    with _db() as con:
+        con.execute(
+            "UPDATE personality_refresh SET last_refreshed=datetime('now') WHERE category=?",
+            (category,),
+        )
+
+
+# ─────────────────────────────────────────────
+# Whisper hallucinations
+# ─────────────────────────────────────────────
+
+def seed_hallucination(phrase: str) -> None:
+    with _db() as con:
+        con.execute(
+            "INSERT OR IGNORE INTO whisper_hallucinations (phrase, is_seed) VALUES (?,1)", (phrase,)
+        )
+
+
+def get_hallucinations() -> set:
+    with _db() as con:
+        rows = con.execute("SELECT phrase FROM whisper_hallucinations").fetchall()
+    return {r["phrase"] for r in rows}

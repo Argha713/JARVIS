@@ -29,6 +29,22 @@ _EOD_RE = re.compile(
     re.I,
 )
 
+# Phase 5.5: multi-turn site teaching patterns
+_TAG_TEACH_RE = re.compile(r'\bwhen\s+i\s+say\b', re.IGNORECASE)
+_REFRESH_RE   = re.compile(
+    r'\b(refresh|update|re-?learn|rebuild|sync)\b.{0,25}\b(portal|knowledge|web|site|data)\b'
+    r'|\blearn\s+the\s+portal\b|\bupdate\s+portal\s+knowledge\b',
+    re.IGNORECASE,
+)
+_URL_DETECT_RE = re.compile(
+    r'\b(?:https?://|www\.)\S+|\b\w[\w.-]+\.(?:com|org|net|io|in|co\.in)\b',
+    re.IGNORECASE,
+)
+_ALIAS_QUESTION_RE = re.compile(
+    r'\b(?:what|how|show|tell|check|find|get|is|when|where|who|which)\b',
+    re.IGNORECASE,
+)
+
 
 def _derive_procedure_meta(user_input: str) -> tuple:
     """
@@ -123,6 +139,24 @@ class TaskRouter:
         conversation so they don't fall through to the 60s LLM router.
         Returns None if no pre-route match (fall through to LLM routing).
         """
+        # Phase 5.5 — Tag teaching: "when I say paipa, I mean my office portal"
+        # Must run BEFORE resolver — query contains portal keywords that would pre-route it
+        if _TAG_TEACH_RE.search(user_input):
+            logger.info("[ROUTER] Tag teaching command — routing to web engine")
+            return {"tool": "web", "params": {"action": "teach_tag", "text": user_input}}
+
+        # Phase 5.5 — Manual portal knowledge refresh: "refresh portal knowledge"
+        if _REFRESH_RE.search(user_input):
+            logger.info("[ROUTER] Manual refresh command — routing to web engine")
+            return {"tool": "web", "params": {"action": "refresh_knowledge", "text": user_input}}
+
+        # Phase 5.5 — URL response: user replied to "Could you give me the URL?"
+        # Must run BEFORE resolver so a bare domain isn't mis-routed as a portal query
+        _web_engine = getattr(self.tools, '_tools', {}).get("web") if self.tools else None
+        if _web_engine and getattr(_web_engine, '_pending_site_query', None) and _URL_DETECT_RE.search(user_input):
+            logger.info("[ROUTER] URL response detected — routing to web engine (teach_site)")
+            return {"tool": "web", "params": {"action": "teach_site", "text": user_input}}
+
         try:
             from tools.web_engine.resolver import resolve
             site_id, intent = resolve(user_input)
@@ -159,6 +193,19 @@ class TaskRouter:
                 return {"tool": "web", "params": params}
         except Exception as e:
             logger.debug(f"[ROUTER] Temporal follow-up check failed: {e}")
+
+        # Phase 5.5 — Alias response: user replied to "Any other names for it?"
+        # Placed LAST so normal portal queries (resolver match) take priority.
+        # Only catch short inputs that don't look like data queries.
+        if _web_engine and getattr(_web_engine, '_pending_alias_site_id', None):
+            if _ALIAS_QUESTION_RE.search(user_input):
+                # Looks like a real question — user moved on; clear the alias state
+                logger.debug("[ROUTER] Question word detected during alias wait — clearing alias state")
+                _web_engine._pending_alias_site_id = None
+                _web_engine._original_query_after_teach = None
+            else:
+                logger.info("[ROUTER] Alias response detected — routing to web engine (add_aliases)")
+                return {"tool": "web", "params": {"action": "add_aliases", "text": user_input}}
 
         return None
 

@@ -10,16 +10,14 @@ from core.voice_output import VoiceOutput
 from core.narration import Narration
 from core.llm import LLMEngine
 from core.task_router import TaskRouter
+from core import personality
 from memory.chroma_store import ChromaStore
 from tools.registry import ToolRegistry
+from tools.web_engine import store
 
 
-# Whisper hallucination phrases emitted on silence/ambient noise
-_WHISPER_HALLUCINATIONS = {
-    "thanks for watching", "thank you for watching", "thank you", "thanks",
-    "you", ".", "..", "...", "subtitles by", "subscribe", "bye",
-    "please subscribe", "like and subscribe",
-}
+# Whisper hallucination phrases — populated from DB at boot via personality.boot()
+_WHISPER_HALLUCINATIONS: set = set()
 
 def _is_real_speech(text: str) -> bool:
     """Return False if the transcription looks like a Whisper noise hallucination."""
@@ -43,7 +41,13 @@ def _is_real_speech(text: str) -> bool:
         if words[:half] == words[half:half * 2]:
             logger.debug(f"[FILTER] Rejected (repeated phrase): {text!r}")
             return False
-
+        
+    # Todo - I want to add a functionality to detect if the user is just playing with JARVIS and not actually saying anything meaningful. If the user is just playing with JARVIS, I want to respond with a witty or funny response to keep the interaction engaging. For example, if the user says "blah blah blah" or "lalala", I want JARVIS to respond with something like "I see you're having fun, but let's get back to business!" or "I appreciate your enthusiasm, but let's focus on the task at hand." This will make JARVIS feel more like a friend and less like a robot.
+    # Todo - i want to implement this by adding a check for common "nonsense" phrases that people might say when they're just playing around. If the transcribed text matches one of these phrases, I'll have JARVIS respond with a witty comment instead of trying to process it as a command. This will help keep the interaction lighthearted and fun, while also encouraging the user to give real commands when they're ready.
+    # ToDo - i want to _WHISPER_HALLUCINATIONS goes from DB. This way, I can easily update the list of known hallucinations without changing the code. I can create a table in the database to store these phrases and have JARVIS query it during startup to populate the _WHISPER_HALLUCINATIONS set. This will make it more flexible and allow me to add new phrases as I discover them or as users report them.
+    # ToDo - also the text goes through llm to check if it is a valid command or just nonsense. If it is nonsense, JARVIS will respond with a witty comment. This will help keep the interaction engaging and fun, while also ensuring that JARVIS only processes valid commands.
+    # ToDo - if the text is whisper hallucination, add that into db as well, this way we can keep track of new hallucinations that we discover and continuously improve the filtering mechanism. We can have a feedback loop where if JARVIS detects a hallucination that wasn't previously known, it can log it and add it to the database for future reference. This will help make JARVIS more robust over time and reduce false positives from Whisper's noise hallucinations.
+    
     return True
 
 
@@ -65,6 +69,9 @@ async def main():
 
     wake_queue: asyncio.Queue = asyncio.Queue()
     wake_listener = WakeWordListener(loop, wake_queue, config)
+
+    personality.boot(config)
+    _WHISPER_HALLUCINATIONS.update(store.get_hallucinations())
 
     await tts.speak("JARVIS online. Ready when you are, sir.")
     logger.info(
@@ -111,31 +118,42 @@ async def main():
             first_turn = True
             while in_conversation:
                 try:
-                    await tts.speak("Listening...")
+                    await tts.speak(personality.say("listening"))
+                    #ToDo - I don't want only "Listening..." but also "What can I do for you?" or something like that. Maybe randomize between a few options. JARVIS should be more engaging and less robotic, funny or friendly.
                     # First turn: no timeout (user already activated JARVIS).
                     # Follow-up turns: time out if no speech within window.
                     wait_sec = None if first_turn else CONVERSATION_TIMEOUT_SEC
+                    #ToDo - maybe add a shorter timeout for the first turn as well, like 60 seconds,
+                    #to avoid waiting indefinitely if something goes wrong with the recorder or the user
+                    # walks away after activating JARVIS.
+                    #response like "Sorry, I didn't catch that. are you saying something or just playing with me." 
+                    #something intersting, friendly, funny, jarvis is users friend. it should be acting like friend.
+                    #not the same line every time - feels like a robot, maybe randomize between a few options to keep it engaging.
                     audio = await recorder.record(max_wait_sec=wait_sec)
                     first_turn = False
                 except Exception as e:
                     logger.exception("Command cycle error")
-                    narration.say("Sorry, I had trouble with that.")
+                    narration.say(personality.say("error"))
                     break
 
                 # Empty array = conversation timeout (no speech detected)
                 if audio is not None and len(audio) == 0:
                     logger.info("[CYCLE] Conversation timeout — returning to wake word mode.")
-                    narration.say("Standing by, sir.")
+                    narration.say(personality.say("timeout"))
+                    # ToDo - maybe add a witty/friendly response here like "Looks like you went silent, I'll be here when you need me." or "No worries, I'm still here whenever you want to chat." to make it more engaging and less robotic.
                     break
 
                 try:
                     text = await transcriber.transcribe(audio)
                 except Exception as e:
                     logger.exception("Transcription error")
+                    #Todo - What happened if any error occurs during transcription? Maybe add a friendly/witty response here like "Hmm, I couldn't understand that. Maybe try rephrasing?" or "Sorry, I had trouble understanding. Could you say that again?" to make it more engaging and less robotic.
+                    #ToDo - add a friendly/witty response here like "Hmm, I couldn't understand that. Maybe try rephrasing?" or "Sorry, I had trouble understanding. Could you say that again?" to make it more engaging and less robotic.
                     break
 
                 if text.strip() and _is_real_speech(text):
-                    narration.acknowledge()
+                    narration.acknowledge(personality.say("acknowledge"))
+                    # Todo - we set list of ACKNOWLEDGE_PHRASES. i want it to be more dynamic and engaging. 
                     t_start = time.perf_counter()
                     response = await router.handle(text)
                     logger.info(f"[CYCLE] Total processing: {time.perf_counter() - t_start:.1f}s")
@@ -145,7 +163,9 @@ async def main():
                 else:
                     if text.strip():
                         logger.info(f"[CYCLE] Transcription rejected as noise: {text!r}")
-                    narration.say("I didn't catch that.")
+                    narration.say(personality.say("didnt_catch"))
+                    # ToDo - maybe add a witty/friendly response here like "Hmm, I couldn't understand that. Maybe try rephrasing?" or "Sorry, I had trouble understanding. Could you say that again?" to make it more engaging and less robotic.
+                    # ToDo - randomize the response here to avoid repetition and make JARVIS feel more like a friend and less like a robot. For example, you could have a list of responses like ["Sorry, I didn't catch that. Could you say it again?", "Hmm, I couldn't understand that. Maybe try rephrasing?", "My apologies, I had trouble understanding. Could you repeat that?"] and randomly select one each time to keep the interaction fresh and engaging.
                     # Give one more chance before exiting conversation
                     in_conversation = False
 
@@ -156,6 +176,7 @@ async def main():
             narration.worker(),
             command_processor(),
             keyboard_trigger(),
+            personality.refresh_loop(llm, config),
         )
     except (KeyboardInterrupt, asyncio.CancelledError):
         pass
