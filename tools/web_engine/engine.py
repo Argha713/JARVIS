@@ -1,51 +1,46 @@
 """
-WebEngine: main entry point. Called by tools/registry.py.
+WebEngine: thin orchestrator. Called by tools/registry.py.
 
-Handles the full lifecycle:
-  resolve site → read/write intent → retrieve (cached) → discover (new) → write ops
+Delegates to:
+  services/query_router.py  — read-path decision chain
+  services/site_service.py  — site teaching / alias state machine
+  services/intent_service.py — EOD / write-sub-intent detection
+  services/portal_seeder.py  — site seeding on startup
 """
-import re
 import threading
 
 from loguru import logger
 
-from tools.web_engine import store, resolver, retriever, discoverer, validator, api_client
+from tools.web_engine import store, resolver, validator
 from tools.web_engine.actions import form_submit
+from tools.web_engine.services import (
+    intent_service,
+    portal_seeder,
+    query_router,
+)
+from tools.web_engine.services.site_service import SiteService
 
-
-_PASSTHROUGH     = "__PASSTHROUGH__:"
-_PORTAL_TIMEOUT  = "__PORTAL_TIMEOUT__"
+_PASSTHROUGH = "__PASSTHROUGH__:"
 
 
 class WebEngine:
     def __init__(self, narration, config: dict):
-        self.narration = narration
-        self._pending_query: tuple[str, str] | None = None  # (query, site_id) waiting for user confirmation
-        self._last_page_url: dict[str, str] = {}  # site_id → last discovered page URL, used for temporal follow-ups
-        # Phase 5.5: multi-turn site onboarding state
-        self._pending_site_query: str | None = None       # set while waiting for user to give a URL
-        self._pending_alias_site_id: str | None = None    # set while waiting for user to give aliases
-        self._original_query_after_teach: str | None = None  # original query to re-run after site is taught
+        self.narration   = narration
+        self._site_svc   = SiteService()
+        self._pending_query: tuple[str, str] | None = None   # (query, site_id) for background check
+        self._last_page_url: dict[str, str] = {}             # site_id → last discovered page URL
+
         store.init_db()
-        # Validator uses sync Playwright — must run in a thread, not in the asyncio loop
         threading.Thread(target=validator.run_if_due, daemon=True).start()
-        _seed_portal(config)
+        portal_seeder.seed(config)
+
+    # ── Main entry (called by registry) ──────────────────────────────────
 
     def run(self, params: dict) -> str:
-        # Recorder is injected by TaskRouter during first-time execution so
-        # WebEngine steps can be captured for procedure memory. Optional — when
-        # None, nothing related to procedure recording changes.
         recorder = params.get("_recorder")
 
-        # ── Pending confirmation ─────────────────────────────────────────
         if params.get("action") == "confirm_pending":
-            if self._pending_query:
-                q, s = self._pending_query
-                store.add_pending_query(q, s)
-                self._pending_query = None
-                logger.info("[ENGINE] Pending query saved: {!r}", q)
-                return f"{_PASSTHROUGH}I've made a note of it. I'll keep an eye on the portal and let you know as soon as I find it, sir."
-            return f"{_PASSTHROUGH}There's no pending query saved, sir."
+            return self._handle_confirm_pending()
 
         query = params.get("text", "").strip()
         if not query:
@@ -53,343 +48,98 @@ class WebEngine:
 
         logger.info("[ENGINE] Query: {!r}", query)
 
-        # ── Phase 5.5: special action dispatch ──────────────────────────────
+        # ── Special action dispatch ────────────────────────────────────────
         action = params.get("action")
-        if action == "teach_tag":         return self._handle_teach_tag(query)
-        if action == "refresh_knowledge": return self._handle_refresh_knowledge()
-        if action == "teach_site":        return self._handle_teach_site(query)
-        if action == "add_aliases":       return self._handle_add_aliases(query)
+        if action == "teach_tag":
+            return self._site_svc.handle_teach_tag(query)
+        if action == "refresh_knowledge":
+            return self._handle_refresh_knowledge()
+        if action == "teach_site":
+            return self._site_svc.handle_teach_site(query)
+        if action == "add_aliases":
+            return self._site_svc.handle_add_aliases(query, lambda q: self.run({"text": q}))
 
-        # ── Resolve site ────────────────────────────────────────────────────
-        # Accept a caller-provided site_id for temporal follow-ups whose text
-        # ("previous month?") carries no resolvable site signal.
-        site_id_hint = params.get("site_id")
+        # ── Resolve site ─────────────────────────────────────────────────
         site_id, intent = resolver.resolve(query)
+        site_id_hint    = params.get("site_id")
         if site_id is None and site_id_hint:
-            site_id = site_id_hint
-            intent  = "read"
+            site_id, intent = site_id_hint, "read"
             logger.info("[ENGINE] Using caller-provided site_id hint: {}", site_id)
 
         if site_id is None:
-            return self._ask_for_site(query)
+            return self._site_svc.ask_for_site(query)
 
-        # ── Write intent ────────────────────────────────────────────────────
+        # ── Write intent ─────────────────────────────────────────────────
         if intent == "write":
             return self._handle_write(site_id, query, recorder)
 
-        # ── Read intent ─────────────────────────────────────────────────────
+        # ── Read intent → delegate to query_router ────────────────────────
         self.narration.step("Let me look that up...")
+        answer, page_url = query_router.route(
+            query, site_id, self.narration, self._last_page_url, recorder
+        )
 
-        from tools.web_engine.discoverer import _extract_month_target
-        month_target = _extract_month_target(query)
-        needs_fresh  = month_target is not None
-        if needs_fresh:
-            logger.debug("[ENGINE] Decision: needs_fresh=True (month={}) → skip cache, go straight to discoverer",
-                         month_target.strftime("%B %Y") if month_target else "?")
-        else:
-            logger.debug("[ENGINE] Decision: needs_fresh=False → will try API-first, then cache, then discoverer")
-
-        # ── API-first path — direct httpx call, no browser ───────────────
-        page_name = _query_to_page_name(site_id, query)
-        if page_name:
-            logger.debug("[ENGINE] Decision: page_name={!r} resolved → attempting API-first path", page_name)
-            try:
-                api_data = api_client.call_page(site_id, page_name, query)
-                if api_data:
-                    logger.debug("[ENGINE] Decision: API returned data → formatting answer, skip cache+discoverer")
-                    answer = api_client.format_answer(query, api_data)
-                    if answer:
-                        logger.info("[ENGINE] API-first answer for page={!r}", page_name)
-                        return answer
-                    else:
-                        logger.debug("[ENGINE] Decision: format_answer returned empty → falling through")
-                else:
-                    logger.debug("[ENGINE] Decision: API returned None (no endpoints or all failed) "
-                                 "→ falling through to cache/discoverer")
-            except api_client.AuthExpired:
-                logger.info("[ENGINE] Decision: API raised AuthExpired → session needs refresh "
-                            "→ falling through to discoverer for re-login")
-                self.narration.step("The portal session has expired — let me refresh it.")
-        else:
-            logger.debug("[ENGINE] Decision: page_name=None for query {!r} → API-first path skipped", query)
-
-        # ── ChromaDB cache — skip for time-specific queries ───────────────
-        if not needs_fresh:
-            logger.debug("[ENGINE] Decision: needs_fresh=False → checking ChromaDB cache")
-            answer = retriever.retrieve(query, site_id)
-            if answer:
-                logger.debug("[ENGINE] Decision: cache HIT → returning cached answer, skip discoverer")
-                return answer
-            else:
-                logger.debug("[ENGINE] Decision: cache MISS → falling through to discoverer")
-        else:
-            logger.debug("[ENGINE] Decision: needs_fresh=True → skip cache entirely, must use discoverer")
-
-        # ── Discovery — Playwright (first visit, cache miss, auth refresh) ─
-        logger.info("[ENGINE] Decision: all fast paths exhausted → starting Playwright discovery")
-        if not store.site_has_sections(site_id):
-            logger.info("[ENGINE] Decision: site_has_sections=False → first visit narration")
-            self.narration.step("I haven't seen this before — let me find it.")
-        else:
-            logger.debug("[ENGINE] Decision: site_has_sections=True → site known, no first-visit narration")
-
-        # For temporal follow-ups (needs_fresh), pass the last known page URL so
-        # the discoverer starts directly on /my-activity (or /leave etc.) rather
-        # than from the portal home page and failing to navigate there.
-        start_url_hint = self._last_page_url.get(site_id) if needs_fresh else None
-        if start_url_hint:
-            logger.info("[ENGINE] Decision: needs_fresh+last_page_url known → passing start_url={} to discoverer",
-                        start_url_hint)
-        elif needs_fresh:
-            logger.debug("[ENGINE] Decision: needs_fresh but no last_page_url cached → discoverer starts from base")
-        answer, page_url = discoverer.discover(query, site_id, self.narration,
-                                               start_url=start_url_hint, recorder=recorder)
         if page_url:
             self._last_page_url[site_id] = page_url
-        if answer == _PORTAL_TIMEOUT:
+
+        if answer == query_router.PORTAL_TIMEOUT:
             self._pending_query = (query, site_id)
-            logger.info("[ENGINE] Portal timeout — asking user if they want background check")
+            logger.info("[ENGINE] Portal timeout — asking user for background check")
             return (
                 f"{_PASSTHROUGH}The portal seems slow right now. "
                 "Want me to keep checking and let you know when I find it, sir?"
             )
-        if answer:
-            return answer
 
-        return (
+        return answer or (
             "I couldn't find that data on the portal. "
             "If you tell me which page it's on, I can look there directly."
         )
 
-    # ──────────────────────────────────────────────
-    # Site teaching
-    # ──────────────────────────────────────────────
-
-    def _ask_for_site(self, query: str) -> str:
-        """
-        JARVIS doesn't know which site to use. Sets pending state so the next
-        turn (user provides URL) is correctly routed via task_router._pre_route().
-        """
-        auto_tags = resolver.extract_tags_from_query(query)
-        logger.info("[ENGINE] Unknown site for query {!r} — asking user", query)
-        tag_hint = f" ({', '.join(auto_tags)})" if auto_tags else ""
-        self._pending_site_query = query
-        self._original_query_after_teach = query
-        return (
-            f"{_PASSTHROUGH}I don't know which website{tag_hint} has that information. "
-            f"Could you give me the URL, sir?"
-        )
-
-    # ──────────────────────────────────────────────
-    # Phase 5.5: special action handlers
-    # ──────────────────────────────────────────────
-
-    def _handle_teach_tag(self, user_input: str) -> str:
-        """Handle 'when I say X, I mean Y' — adds tag alias for a known site."""
-        m = re.search(
-            r"when\s+i\s+say\s+['\"]?(.+?)['\"]?,?\s+i\s+mean\s+(.+)",
-            user_input, re.I
-        )
-        if not m:
-            return (
-                f"{_PASSTHROUGH}I didn't quite understand that, sir. "
-                f"Try: 'when I say X, I mean Y'."
-            )
-        new_alias = m.group(1).strip().lower()
-        site_ref  = m.group(2).strip()
-        site_id, _ = resolver.resolve(site_ref)
-        if site_id:
-            store.add_tag(site_id, new_alias)
-            logger.info("[ENGINE] Tag taught: {!r} → {}", new_alias, site_id)
-            return f"{_PASSTHROUGH}Got it, sir. I'll recognise '{new_alias}' as {site_id} from now on."
-        return (
-            f"{_PASSTHROUGH}I don't know '{site_ref}' yet, sir. "
-            f"Tell me its URL first and I'll remember the alias."
-        )
-
-    def _handle_refresh_knowledge(self) -> str:
-        """Handle 'refresh portal knowledge' — runs validator in background."""
-        threading.Thread(
-            target=validator.run_full,
-            args=(self.narration,),
-            daemon=True,
-        ).start()
-        logger.info("[ENGINE] Manual portal knowledge refresh triggered")
-        return f"{_PASSTHROUGH}I'll update everything in the background, sir."
-
-    def _handle_teach_site(self, url_input: str) -> str:
-        """Handle user's URL reply after JARVIS asked 'Could you give me the URL?'"""
-        original_query = self._pending_site_query
-        self._pending_site_query = None
-
-        url_m = re.search(
-            r'(https?://\S+|(?:www\.)?[\w][\w.-]+\.(?:com|org|net|io|in|co\.in)(?:/\S*)?)',
-            url_input, re.I
-        )
-        if not url_m:
-            self._pending_site_query = original_query  # restore so user can try again
-            return f"{_PASSTHROUGH}I couldn't find a URL in that. Could you say it again, sir?"
-
-        raw_url = url_m.group(1)
-        auto_tags = resolver.extract_tags_from_query(original_query or url_input)
-        site_response = self.teach_site(raw_url, auto_tags)
-
-        # Derive site_id from the URL we just registered
-        base_url = raw_url if raw_url.startswith("http") else f"https://{raw_url}"
-        self._pending_alias_site_id = base_url.replace("https://", "").replace("http://", "").rstrip("/")
-
-        return f"{_PASSTHROUGH}{site_response}"
-
-    _NO_ALIAS = frozenset(["no", "nothing", "none", "nope", "skip", "done",
-                            "that's fine", "that's ok", "no thanks", "nevermind"])
-
-    def _handle_add_aliases(self, alias_input: str) -> str:
-        """Handle user's alias list reply after JARVIS asked 'Any other names for it?'"""
-        site_id        = self._pending_alias_site_id
-        original_query = self._original_query_after_teach
-        self._pending_alias_site_id    = None
-        self._original_query_after_teach = None
-
-        # User declined to add aliases
-        clean = alias_input.lower().strip().rstrip('.!?')
-        if clean in self._NO_ALIAS or len(clean) < 2:
-            if original_query:
-                return self.run({"action": "query", "text": original_query})
-            return f"{_PASSTHROUGH}Got it, sir."
-
-        parts   = re.split(r'[,\n]+|\band\b', alias_input, flags=re.I)
-        aliases = [p.strip().lower() for p in parts if p.strip() and len(p.strip()) > 1]
-        for alias in aliases:
-            store.add_tag(site_id, alias)
-            logger.info("[ENGINE] Alias added: {!r} → {}", alias, site_id)
-
-        alias_str = ", ".join(f"'{a}'" for a in aliases)
-
-        if original_query:
-            logger.info("[ENGINE] Re-running original query after site teach: {!r}", original_query)
-            return self.run({"action": "query", "text": original_query})
-
-        return f"{_PASSTHROUGH}Got it, sir. I'll also recognise {alias_str} as {site_id}."
-
-    def teach_site(self, url: str, tags: list[str], name: str = "") -> str:
-        """
-        Register a new site (called when the user provides a URL in follow-up).
-        """
-        base_url = url if url.startswith("http") else f"https://{url}"
-        site_id  = base_url.replace("https://", "").replace("http://", "").rstrip("/")
-        resolver.register_site(site_id, base_url, name, tags)
-        logger.info("[ENGINE] Site taught: {} | tags: {}", site_id, tags)
-        return f"Got it. I'll look for that on {site_id}. Any other names for it?"
-
-    def add_alias(self, site_id: str, alias: str) -> str:
-        store.add_tag(site_id, alias.strip().lower())
-        return f"Got it — I'll also recognise {alias!r} as {site_id}."
-
-    # ──────────────────────────────────────────────
-    # Write operations
-    # ──────────────────────────────────────────────
+    # ── Write handler ─────────────────────────────────────────────────────
 
     def _handle_write(self, site_id: str, query: str, recorder=None) -> str:
-        # Detect EOD submission
-        eod_match = re.search(
-            r"(?:submit|send|log|write|record)\s+(?:my\s+)?(?:eod|end[- ]of[- ]day|work journal)[:\s]+(.+)",
-            query, re.I
-        )
-        if eod_match:
-            text = eod_match.group(1).strip()
+        eod_text = intent_service.extract_eod_text(query)
+        if eod_text:
             self.narration.step("Opening work journal...")
-            return form_submit.run(site_id, "form_submit_eod", {"text": text}, recorder=recorder)
-
-        # Generic: open visible browser for user to interact
+            return form_submit.run(site_id, "form_submit_eod", {"text": eod_text}, recorder=recorder)
         site = store.get_site(site_id)
         if site:
             self.narration.step(f"Opening {site['name'] or site_id} for you...")
-        return f"Please complete this action in the browser that's opening now."
+        return "Please complete this action in the browser that's opening now."
 
+    # ── Misc handlers ─────────────────────────────────────────────────────
 
-def _query_to_page_name(site_id: str, query: str) -> str | None:
-    """Map a query to the portal page_name used for API endpoint lookup."""
-    if site_id != _PORTAL_SITE_ID:
-        return None
-    q = query.lower()
-    if any(w in q for w in ("attendance", "punctuality", "activity", "check in",
-                             "check out", "active hours", "working hours",
-                             "punctual", "hours worked")):
-        return "activity"
-    if any(w in q for w in ("leave", "casual leave", "sick leave", "leave balance",
-                             "leaves remaining", "leaves left")):
-        return "leave"
-    if any(w in q for w in ("request", "ticket", "support ticket", "support request")):
-        return "requests"
-    return None
+    def _handle_confirm_pending(self) -> str:
+        if self._pending_query:
+            q, s = self._pending_query
+            store.add_pending_query(q, s)
+            self._pending_query = None
+            logger.info("[ENGINE] Pending query saved: {!r}", q)
+            return (
+                f"{_PASSTHROUGH}I've made a note of it. I'll keep an eye on the portal "
+                "and let you know as soon as I find it, sir."
+            )
+        return f"{_PASSTHROUGH}There's no pending query saved, sir."
 
+    def _handle_refresh_knowledge(self) -> str:
+        threading.Thread(target=validator.run_full, args=(self.narration,), daemon=True).start()
+        logger.info("[ENGINE] Manual knowledge refresh triggered")
+        return f"{_PASSTHROUGH}I'll update everything in the background, sir."
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Bootstrap: seed the portal site + EOD action so it works on day one
-# without requiring explicit "teach me the portal" flow.
-# ──────────────────────────────────────────────────────────────────────────────
+    # ── Public helpers (backward-compatible with task_router) ─────────────
 
-_PORTAL_SITE_ID = "people.codeclouds.com"
-_PORTAL_BASE    = "https://people.codeclouds.com"
-_PORTAL_TAGS    = [
-    # Site identity
-    "office portal", "hr portal", "portal", "simplified hr",
-    "paipa", "codeclouds", "people", "work portal",
-    # HR data keywords — so queries like "my attendance" pre-route here without LLM
-    "attendance", "punctuality", "leave", "leaves", "casual leave", "sick leave",
-    "activity", "activity rate", "activity percentage", "eod", "end of day",
-    "work journal", "seat booking", "seat", "support ticket", "request",
-    "salary", "payslip", "holiday", "timesheet", "check in", "check out",
-]
+    def teach_site(self, url: str, tags: list[str], name: str = "") -> str:
+        return self._site_svc.teach_site(url, tags, name)
 
-def _seed_portal(config: dict) -> None:
-    """Register the office portal and ensure all tags are present."""
-    existing = store.get_site(_PORTAL_SITE_ID)
-    if not existing:
-        store.upsert_site(_PORTAL_SITE_ID, _PORTAL_BASE, "Simplified HR Portal")
+    def add_alias(self, site_id: str, alias: str) -> str:
+        return self._site_svc.add_alias(site_id, alias)
 
-    # Always sync tags — idempotent (INSERT OR IGNORE)
-    for tag in _PORTAL_TAGS:
-        store.add_tag(_PORTAL_SITE_ID, tag)
+    # ── Properties exposed so task_router can check pending state ─────────
 
-    # Seed EOD form action
-    store.upsert_action(_PORTAL_SITE_ID, "form_submit_eod", {
-        "url":    "/my-apps/work-journal",
-        "fields": [{"selector": "textarea", "value": "{text}"}],
-        "submit": "button[type='submit']",
-        "wait_ms": 3000,
-    })
+    @property
+    def _pending_site_query(self) -> str | None:
+        return self._site_svc._pending_site_query
 
-    # Seed read page hints — used by discoverer to navigate directly to the right page
-    store.upsert_action(_PORTAL_SITE_ID, "page_activity", {
-        "url":      "/my-activity",
-        "keywords": ["attendance", "activity", "punctuality", "check in", "check out",
-                     "active hours", "activity rate", "activity percentage"],
-    })
-    store.upsert_action(_PORTAL_SITE_ID, "page_leave", {
-        "url":      "/leave",
-        "keywords": ["leave", "leaves", "casual leave", "sick leave", "leave balance",
-                     "leave remaining", "leave count"],
-    })
-    store.upsert_action(_PORTAL_SITE_ID, "page_requests", {
-        "url":      "/requests",
-        "keywords": ["request", "ticket", "support ticket", "support request"],
-    })
-    store.upsert_action(_PORTAL_SITE_ID, "page_work_journal", {
-        "url":      "/my-apps/work-journal",
-        "keywords": ["work journal", "journal", "today task", "today work"],
-    })
-
-    # Migrate session from legacy portal_session.json if it exists
-    import json
-    from pathlib import Path
-    legacy = Path("data/portal_session.json")
-    if legacy.exists():
-        try:
-            session_data = json.loads(legacy.read_text(encoding="utf-8"))
-            store.save_session(_PORTAL_SITE_ID, session_data)
-            logger.info("[ENGINE] Migrated legacy portal session to SQLite")
-        except Exception as e:
-            logger.warning("[ENGINE] Could not migrate legacy session: {}", e)
-
-    logger.info("[ENGINE] Portal seeded with {} tags", len(_PORTAL_TAGS))
+    @property
+    def _pending_alias_site_id(self) -> str | None:
+        return self._site_svc._pending_alias_site_id
