@@ -4,6 +4,7 @@ import re
 import time
 from core.llm import LLMEngine
 from core.narration import Narration
+from core import personality
 from loguru import logger
 
 MAX_HISTORY_TURNS = 6  # keep last 3 user+assistant pairs
@@ -225,17 +226,20 @@ class TaskRouter:
                 config = json.load(f)
         except Exception as e:
             logger.error(f"[SWITCH] Cannot read config: {e}")
-            return "I couldn't read my config file, sir."
+            return f"{personality.say('system_error')} couldn't read my config file."
+        # ToDo - maybe we can add a personality module response here too, random, if needed add different personality category.
 
         current = config["llm"].get("provider", "ollama")
         if target == current:
-            return f"I'm already using {target}, sir."
+            return f"{personality.say('system_confirm')} You're already on {target}."
+        # ToDo - maybe we can add a personality module response here too, random, if needed add different personality category.
 
         if target == "openai" and not config["llm"].get("openai_api_key", "").strip():
             return (
-                "I don't have an OpenAI API key configured yet. "
-                "Please run 'python setup.py' in the terminal to add it, sir."
+                f"{personality.say('system_error')} no OpenAI API key configured. "
+                "Please run 'python setup.py' in the terminal to add it."
             )
+        # ToDo - maybe we can add a personality module response here too, random, if needed add different personality category.
 
         config["llm"]["provider"] = target
         try:
@@ -243,12 +247,14 @@ class TaskRouter:
                 json.dump(config, f, indent=4)
         except Exception as e:
             logger.error(f"[SWITCH] Cannot write config: {e}")
-            return "I couldn't save the config change, sir."
+            return f"{personality.say('system_error')} couldn't save the config change."
+        # ToDo - maybe we can add a personality module response here too, random, if needed add different personality category.
 
         self.llm.reload_provider(config)
         provider_label = "OpenAI" if target == "openai" else "Ollama"
         logger.info(f"[SWITCH] Switched to {provider_label}")
-        return f"Done. Switched to {provider_label}, sir. No restart needed."
+        return f"{personality.say('system_confirm')} Switched to {provider_label}. No restart needed."
+        # ToDo - maybe we can add a personality module response here too, random, if needed add different personality category.
 
     # ──────────────────────────────────────────────────────────────────────────
     # Phase 4: Procedure execution
@@ -468,7 +474,8 @@ class TaskRouter:
 
     async def handle(self, user_input: str) -> str:
         if not user_input.strip():
-            return "I didn't catch that. Could you say that again?"
+            return personality.say("didnt_catch")
+        # Todo - can we use the personality module? personality.say("didnt_catch")? 
 
         # Check for provider switch command before anything else
         switch_response = self._handle_provider_switch(user_input)

@@ -7,24 +7,28 @@ from loguru import logger
 
 from tools.web_engine import store
 
-_CATEGORIES = ["listening", "timeout", "didnt_catch", "acknowledge", "nonsense", "error"]
+_CATEGORIES = ["listening", "timeout", "didnt_catch", "acknowledge", "nonsense", "error", "system_error", "system_confirm"]
 
 _CATEGORY_CONTEXT = {
-    "listening":   "played when JARVIS starts listening for the user's command",
-    "timeout":     "played when the user went silent and JARVIS returns to standby",
-    "didnt_catch": "played when audio was too noisy or unclear to understand",
-    "acknowledge": "quick acknowledgment before JARVIS processes a command (1-5 words max)",
-    "nonsense":    "played when the user is clearly playing around or said gibberish",
-    "error":       "played when a technical error occurs internally",
+    "listening":       "played when JARVIS starts listening for the user's command",
+    "timeout":         "played when the user went silent and JARVIS returns to standby",
+    "didnt_catch":     "played when audio was too noisy or unclear to understand",
+    "acknowledge":     "quick acknowledgment before JARVIS processes a command (1-5 words max)",
+    "nonsense":        "played when the user is clearly playing around or said gibberish",
+    "error":           "played when a technical error occurs internally",
+    "system_error":    "very short prefix before a specific error detail — ends with a dash so the fact follows naturally (e.g. 'No luck — couldn\\'t read config')",
+    "system_confirm":  "confirms a completed action or current system state — short and punchy, works for both 'done' and 'already set' situations",
 }
 
 _SEEDS = {
-    "listening":   ["Listening.", "Go ahead, sir.", "I'm all ears."],
-    "timeout":     ["Standing by.", "I'll be here.", "Silence noted. Whenever you're ready."],
-    "didnt_catch": ["I didn't catch that.", "Say that again?", "Come again?"],
-    "acknowledge": ["On it.", "Got it.", "Right away."],
-    "nonsense":    ["That was... something.", "Are you speaking human today?", "Fascinating input."],
-    "error":       ["Something went wrong on my end.", "Hit a snag. Try again.", "That didn't go as planned."],
+    "listening":      ["Listening.", "Go ahead, sir.", "I'm all ears."],
+    "timeout":        ["Standing by.", "I'll be here.", "Silence noted. Whenever you're ready."],
+    "didnt_catch":    ["I didn't catch that.", "Say that again?", "Come again?"],
+    "acknowledge":    ["On it.", "Got it.", "Right away."],
+    "nonsense":       ["That was... something.", "Are you speaking human today?", "Fascinating input."],
+    "error":          ["Something went wrong on my end.", "Hit a snag. Try again.", "That didn't go as planned."],
+    "system_error":   ["Ran into a snag —", "No luck —", "Hit a wall —", "Something's off —", "Uh oh —"],
+    "system_confirm": ["Done.", "All set, sir.", "Sorted.", "Noted.", "Consider it done."],
 }
 
 _WHISPER_SEED = {
