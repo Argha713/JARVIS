@@ -1,0 +1,37 @@
+{
+  "manifest_version": 3,
+  "name": "JARVIS",
+  "version": "1.0.0",
+  "description": "JARVIS voice assistant — browser integration",
+
+  "permissions": [
+    "tabs",
+    "scripting",
+    "storage",
+    "alarms",
+    "activeTab"
+  ],
+  "host_permissions": ["<all_urls>"],
+
+  "background": {
+    "service_worker": "background/service_worker.js",
+    "type": "module"
+  },
+
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_title": "JARVIS",
+    "default_icon": {
+      "16":  "icons/icon16.png",
+      "48":  "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "jarvis@local",
+      "strict_min_version": "109.0"
+    }
+  }
+}
