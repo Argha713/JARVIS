@@ -34,6 +34,9 @@ keyboard>=0.13.5
 ddgs>=1.0.0
 playwright>=1.40.0
 
+# Browser extension WebSocket server (Phase 6)
+websockets>=12.0
+
 # Utilities
 python-dotenv>=1.0.0
 loguru>=0.7.0

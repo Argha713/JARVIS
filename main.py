@@ -14,6 +14,7 @@ from core import personality
 from memory.chroma_store import ChromaStore
 from tools.registry import ToolRegistry
 from tools.web_engine import store
+from tools.browser_extension import start as start_browser_extension
 
 
 # Whisper hallucination phrases — populated from DB at boot via personality.boot()
@@ -177,6 +178,7 @@ async def main():
             command_processor(),
             keyboard_trigger(),
             personality.refresh_loop(llm, config),
+            start_browser_extension(config),
         )
     except (KeyboardInterrupt, asyncio.CancelledError):
         pass
