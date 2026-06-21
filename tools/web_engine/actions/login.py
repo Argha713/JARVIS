@@ -18,8 +18,16 @@ LOGIN_TIMEOUT_MS = 120_000   # 2 min for user to log in
 def ensure_session(site_id: str, narration) -> bool:
     """
     Ensures a fresh session exists for the site.
+    When the browser extension is connected the user's real browser is already
+    authenticated — no Playwright login needed. Returns True immediately.
+    Falls back to the Playwright login flow when the extension is unavailable.
     Returns True if session is ready, False if login timed out.
     """
+    from tools.browser_extension import connection_manager
+    if connection_manager.is_connected():
+        logger.debug("[LOGIN] Extension connected — skipping Playwright login for {}", site_id)
+        return True
+
     session = store.load_session(site_id)
     if session:
         logger.debug("[LOGIN] Session for {} is valid", site_id)
