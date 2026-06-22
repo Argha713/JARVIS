@@ -4,6 +4,8 @@
   "version": "1.0.0",
   "description": "JARVIS voice assistant — browser integration",
 
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA6D6xxo28YxGzhyuUQHHjyL2cUdmf81mMS2pBQNBPjUhFZWvLSmLVi/1m8T09WGfphws1C8wS8C4xpg8JrQaIgvubGnbbXoM0XvU4gV6zvxupaEChjmDHL4R909wKUUUgSWFovhI8Gr3vE0XSmiK5daU/xE5SB4sxajoHTqe3jiX9agIGL2tyaeICHLnwIaGfADcrMPofRXSYMWFREnihu32deoV9rBWe6MiZBWurdWcYbZvANb1cMicgGeekUzzB5c/qMRFy1R91Pj9VcWadA5WHCByqBggL9cOX6svzwsVPnpWhCLAwAAqYbkKJFTpcjK3X9YEjxYUtLvDxgwR2OwIDAQAB",
+
   "permissions": [
     "tabs",
     "scripting",

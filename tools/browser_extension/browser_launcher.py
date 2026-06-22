@@ -152,6 +152,17 @@ def _build_args(browser: str, exe: Path, profile: str | None) -> list[str]:
     udd  = browser_detector.get_user_data_dir(browser)
 
     if browser in ("chrome", "edge", "brave"):
+        # Load the JARVIS extension automatically — no manual Chrome setup needed.
+        # The extension folder path: tools/browser_extension/ → tools/ → project root → extension/
+        ext_folder = Path(__file__).parent.parent.parent / "extension"
+        if ext_folder.exists():
+            args.append(f"--load-extension={ext_folder}")
+            logger.debug("[Launcher] --load-extension={!r}", str(ext_folder))
+        else:
+            logger.warning("[Launcher] Extension folder not found at {!r}", str(ext_folder))
+
+        args += ["--no-first-run", "--no-default-browser-check"]
+
         if profile and udd.exists():
             args += [
                 f"--user-data-dir={udd}",

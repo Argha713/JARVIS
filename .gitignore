@@ -1,31 +1,46 @@
-# Python
-.venv/
+# ── Secrets & config ──────────────────────────────────────────────────────────
+config.json
+.env
+
+# ── Python ────────────────────────────────────────────────────────────────────
 __pycache__/
-*.pyc
+*.py[cod]
 *.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
 
-# Sensitive — session cookies/login state
-data/portal_session.json
+# ── Virtual environments ───────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
 
-# Runtime databases
-data/chromadb/
-data/web_engine.db
-
-# Generated / temp files
-data/tts_output.wav
-data/portal_activity_debug.html
-data/portal_activity_debug.png
-data/portal_discovery/
-
-# Logs
+# ── JARVIS runtime data ────────────────────────────────────────────────────────
+data/
 logs/
 
-# Large binary model files (re-downloadable)
+# ── Models (large binaries — download separately) ─────────────────────────────
 models/
 
-# Config with personal settings (commit a config.example.json instead)
-config.json
+# ── Extension private key ─────────────────────────────────────────────────────
+data/extension_key.pem
 
-# OS
+# ── IDE ───────────────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
 Thumbs.db
-desktop.ini
+
+# ── Test artifacts ────────────────────────────────────────────────────────────
+.pytest_cache/
+.mypy_cache/
+htmlcov/
+.coverage
+coverage.xml

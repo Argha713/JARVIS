@@ -1,0 +1,72 @@
+{
+  "jarvis": {
+    "wake_word": "hey_jarvis",
+    "language": "en",
+    "voice_model": "en_US-lessac-medium"
+  },
+  "llm": {
+    "provider": "openai",
+    "fast_model": "phi3",
+    "smart_model": "llama3.1:8b",
+    "ollama_host": "http://localhost:11434",
+    "openai_api_key": "sk-proj-YOUR_OPENAI_API_KEY_HERE",
+    "openai_fast_model": "gpt-4o-mini",
+    "openai_smart_model": "gpt-4o"
+  },
+  "whisper": {
+    "provider": "openai",
+    "model_size": "base",
+    "device": "cpu",
+    "compute_type": "int8"
+  },
+  "tts": {
+    "piper_binary": "models/piper/piper.exe",
+    "voice_model": "models/piper/en_US-lessac-medium.onnx",
+    "output_wav": "data/tts_output.wav"
+  },
+  "audio": {
+    "silence_threshold": 0.004,
+    "silence_duration_sec": 1.2,
+    "sample_rate": 16000
+  },
+  "procedures": {
+    "similarity_threshold": 0.75,
+    "broken_procedure_threshold": 3,
+    "double_submit_guard_sec": 30
+  },
+  "personality": {
+    "refresh_threshold_days": 20,
+    "check_interval_hours": 6,
+    "phrases_per_refresh": 15
+  },
+  "browser_extension": {
+    "ws_port": 8765,
+    "browser_path": "",
+    "open_timeout_seconds": 10,
+    "heartbeat_interval_seconds": 20,
+    "search_result_count": 5,
+    "background_tab": true,
+    "extension_id": "dcghhjhjefnaekafninhgnidonlhdlkf",
+    "extension_update_url": ""
+  },
+  "paths": {
+    "project_root": "C:/Users/YOUR_USERNAME/Desktop/Argha/Projects/JARVIS",
+    "data_dir": "C:/Users/YOUR_USERNAME/Desktop/Argha/Projects/JARVIS/data",
+    "models_dir": "C:/Users/YOUR_USERNAME/Desktop/Argha/Projects/JARVIS/models",
+    "logs_dir": "C:/Users/YOUR_USERNAME/Desktop/Argha/Projects/JARVIS/logs",
+    "search_drives": [
+      "C:/",
+      "D:/"
+    ]
+  },
+  "web_engine": {
+    "portal_url": "https://YOUR_PORTAL_URL_HERE",
+    "portal_username": "YOUR_PORTAL_USERNAME",
+    "portal_password": "YOUR_PORTAL_PASSWORD",
+    "login_url": "https://YOUR_PORTAL_URL_HERE/login"
+  },
+  "accounts": {
+    "google_personal": { "email": "your.personal@gmail.com", "authuser": 0 },
+    "google_work":     { "email": "your.work@company.com",   "authuser": 1 }
+  }
+}
