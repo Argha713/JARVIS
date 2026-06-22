@@ -79,8 +79,34 @@ def list_profiles(browser: str) -> list[dict]:
         profiles = _list_firefox_profiles(udd)
     else:
         profiles = _list_chromium_profiles(udd)
-    logger.info("[Detector] Profiles for {}: {}", browser, [p["name"] for p in profiles])
+    logger.info("[Detector] Profiles for {}: {}",
+                browser, [(p["name"], p["display_name"]) for p in profiles])
     return profiles
+
+
+def is_running(browser: str) -> bool:
+    """
+    Return True if the REAL browser is running with its normal user data directory.
+
+    Uses the browser's SingletonLock file rather than tasklist. Tasklist would also
+    detect Playwright's bundled Chromium (which shares the chrome.exe binary name on
+    Windows) causing false positives when the validator's headless browser is active.
+    SingletonLock is only written by the real browser instance — Playwright uses an
+    isolated temp user-data-dir and never touches the user's Chrome directory.
+
+    Edge case: if Chrome crashes without cleanup, the lock file can remain (stale).
+    Chrome itself handles stale locks on next start; for us the worst case is a 10s
+    wait then Playwright fallback, which is acceptable.
+    """
+    udd = get_user_data_dir(browser)
+    if not udd.exists():
+        logger.debug("[Detector] is_running {!r} → False (user_data_dir not found)", browser)
+        return False
+    lock = udd / "SingletonLock"
+    found = lock.exists()
+    logger.debug("[Detector] is_running {!r} → {} (SingletonLock {})",
+                 browser, found, "present" if found else "absent")
+    return found
 
 
 def infer_profile_for_domain(browser: str, domain: str) -> str | None:
@@ -223,28 +249,49 @@ def _list_chromium_profiles(user_data_dir: Path) -> list[dict]:
     if not user_data_dir.exists():
         logger.debug("[Detector] Chromium user_data_dir not found: {!r}", str(user_data_dir))
         return []
+
+    # Local State is authoritative — it's what Chrome's profile switcher UI reads.
+    # Individual Preferences files can have stale/generic names like "Your Chrome".
+    ls_cache: dict = {}
+    local_state = user_data_dir / "Local State"
+    if local_state.exists():
+        try:
+            ls_data  = json.loads(local_state.read_text(encoding="utf-8", errors="ignore"))
+            ls_cache = ls_data.get("profile", {}).get("info_cache", {})
+        except Exception as exc:
+            logger.debug("[Detector] Could not read Local State: {}", exc)
+
     profiles = []
     for entry in user_data_dir.iterdir():
         if not entry.is_dir():
             continue
         if entry.name != "Default" and not entry.name.startswith("Profile "):
             continue
-        prefs_path    = entry / "Preferences"
-        display_name  = entry.name
-        last_used     = 0.0
-        if prefs_path.exists():
-            try:
-                prefs        = json.loads(prefs_path.read_text(encoding="utf-8", errors="ignore"))
-                display_name = prefs.get("profile", {}).get("name", entry.name) or entry.name
-                last_used    = float(prefs.get("profile", {}).get("last_used", 0) or 0)
-            except Exception as exc:
-                logger.debug("[Detector] Could not read Preferences for {}: {}", entry.name, exc)
+
+        ls_entry     = ls_cache.get(entry.name, {})
+        display_name = ls_entry.get("name") or entry.name
+        last_used    = float(ls_entry.get("last_used", 0) or 0)
+        email        = ls_entry.get("user_name", "")
+
+        # Fall back to Preferences if Local State had nothing for this profile dir
+        if not ls_entry:
+            prefs_path = entry / "Preferences"
+            if prefs_path.exists():
+                try:
+                    prefs        = json.loads(prefs_path.read_text(encoding="utf-8", errors="ignore"))
+                    display_name = prefs.get("profile", {}).get("name", entry.name) or entry.name
+                    last_used    = float(prefs.get("profile", {}).get("last_used", 0) or 0)
+                except Exception as exc:
+                    logger.debug("[Detector] Could not read Preferences for {}: {}", entry.name, exc)
+
         profiles.append({
             "name":         entry.name,
             "display_name": display_name,
+            "email":        email,
             "path":         entry,
             "last_used":    last_used,
         })
+
     profiles.sort(key=lambda p: p["last_used"], reverse=True)
     return profiles
 

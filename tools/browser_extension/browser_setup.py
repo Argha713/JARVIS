@@ -32,8 +32,6 @@ from . import browser_detector, browser_launcher, connection_manager
 _PROFILE_OVERRIDE_TIMEOUT = 10
 # Seconds to listen for browser choice when multiple browsers found
 _BROWSER_CHOICE_TIMEOUT   = 15
-# Small delay (s) before recording to let TTS narration finish speaking
-_NARRATION_SETTLE         = 2.5
 
 # Words that mean "keep the default / I'm fine with it"
 _CONFIRM_WORDS = frozenset([
@@ -110,11 +108,24 @@ async def _run_setup(site_id, config, narration, recorder, transcriber) -> bool:
                     browser_info["browser"], msg)
         narration.say(msg)
     else:
-        logger.info("[BrowserSetup] Step 4: multiple browsers — asking user")
-        browser_info = await _ask_browser_choice(supported, narration, recorder, transcriber)
-        if not browser_info:
-            browser_info = supported[0]
-            logger.info("[BrowserSetup] Step 4: no clear choice — defaulting to {!r}", browser_info["browser"])
+        # Check for a saved preferred browser — if the user already chose before, skip the question
+        pref = store.get_browser_pref("preferred_browser")
+        if pref:
+            matched = next((b for b in supported if b["browser"] == pref), None)
+            if matched:
+                browser_info = matched
+                logger.info("[BrowserSetup] Step 4: using saved preferred browser={!r}", pref)
+            else:
+                logger.info("[BrowserSetup] Step 4: saved pref {!r} not in supported list — asking", pref)
+                browser_info = await _ask_browser_choice(supported, narration, recorder, transcriber)
+                if not browser_info:
+                    browser_info = supported[0]
+        else:
+            logger.info("[BrowserSetup] Step 4: multiple browsers — asking user")
+            browser_info = await _ask_browser_choice(supported, narration, recorder, transcriber)
+            if not browser_info:
+                browser_info = supported[0]
+                logger.info("[BrowserSetup] Step 4: no clear choice — defaulting to {!r}", browser_info["browser"])
 
     browser  = browser_info["browser"]
     profiles = browser_info["profiles"]
@@ -177,7 +188,7 @@ async def _launch_race(site_id, browser, profile, profiles, config, narration, r
                 can_listen, recorder is not None, transcriber is not None, len(profiles))
 
     if can_listen:
-        listen_coro  = _listen_for_override(profiles, recorder, transcriber)
+        listen_coro  = _listen_for_override(profiles, recorder, transcriber, narration=narration)
         listen_task  = asyncio.create_task(listen_coro, name="profile_listen")
         all_tasks    = {launch_task, listen_task}
     else:
@@ -235,6 +246,7 @@ async def _launch_race(site_id, browser, profile, profiles, config, narration, r
         logger.info("[BrowserSetup] Connected! Persisting: browser={!r} profile={!r}", browser, final_profile)
         if site_id:
             store.save_site_profile(site_id, browser, final_profile or "Default")
+        store.set_browser_pref("preferred_browser", browser)
         store.mark_profile_installed(browser, final_profile or "Default")
         store.mark_profile_connected(browser, final_profile or "Default")
         narration.say(personality.say("browser_connected"))
@@ -264,7 +276,7 @@ async def _ask_browser_choice(supported, narration, recorder, transcriber) -> di
         logger.debug("[BrowserSetup] No recorder/transcriber — cannot listen for browser choice")
         return None
 
-    await asyncio.sleep(_NARRATION_SETTLE)
+    await narration.wait_until_idle(buffer_sec=0.5)
     logger.debug("[BrowserSetup] Recording browser choice ({}s) …", _BROWSER_CHOICE_TIMEOUT)
 
     try:
@@ -273,7 +285,7 @@ async def _ask_browser_choice(supported, narration, recorder, transcriber) -> di
         logger.warning("[BrowserSetup] recorder.record() failed: {}", exc)
         return None
 
-    if not audio or len(audio) == 0:
+    if audio is None or len(audio) == 0:
         logger.info("[BrowserSetup] No audio for browser choice — defaulting to first")
         return None
 
@@ -295,13 +307,16 @@ async def _ask_browser_choice(supported, narration, recorder, transcriber) -> di
     return None
 
 
-async def _listen_for_override(profiles, recorder, transcriber) -> str | None:
+async def _listen_for_override(profiles, recorder, transcriber, narration=None) -> str | None:
     """
-    Record for _PROFILE_OVERRIDE_TIMEOUT seconds (with a short settle delay first).
+    Record for _PROFILE_OVERRIDE_TIMEOUT seconds, waiting for JARVIS to finish speaking first.
     Parse the transcription for a profile name reference.
     Returns a profile directory name string, or None (keep the current profile).
     """
-    await asyncio.sleep(_NARRATION_SETTLE)
+    if narration is not None:
+        await narration.wait_until_idle(buffer_sec=0.5)
+    else:
+        await asyncio.sleep(2.5)
     logger.debug("[BrowserSetup] Listening for profile override ({}s) …", _PROFILE_OVERRIDE_TIMEOUT)
 
     try:
@@ -310,7 +325,7 @@ async def _listen_for_override(profiles, recorder, transcriber) -> str | None:
         logger.warning("[BrowserSetup] recorder.record() failed during override listen: {}", exc)
         return None
 
-    if not audio or len(audio) == 0:
+    if audio is None or len(audio) == 0:
         logger.info("[BrowserSetup] No audio during override window — keeping current profile")
         return None
 
@@ -342,12 +357,21 @@ async def _listen_for_override(profiles, recorder, transcriber) -> str | None:
             logger.info("[BrowserSetup] Override matched by number: {!r}", target)
             return target
 
-    # "work", "personal", "home", "office" as partial display name matches
+    # Partial display name word match ("work", "office", "personal", "lido" etc.)
     for p in profiles:
-        name_words = p["display_name"].lower().split()
+        name_words = p["display_name"].lower().split("_") + p["display_name"].lower().split()
         if any(w in text_lower for w in name_words if len(w) > 3):
             logger.info("[BrowserSetup] Override partial match: {!r} → {!r}", p["display_name"], p["name"])
             return p["name"]
+
+    # Email domain match ("codeclouds", "lidolabs", "gmail" etc.)
+    for p in profiles:
+        email = p.get("email", "")
+        if email:
+            domain = email.split("@")[-1].split(".")[0].lower()  # "codeclouds" from "argha@codeclouds.com"
+            if len(domain) > 3 and domain in text_lower:
+                logger.info("[BrowserSetup] Override email-domain match: {!r} email={!r} → {!r}", domain, email, p["name"])
+                return p["name"]
 
     logger.info("[BrowserSetup] Could not match profile from {!r} — keeping current", text)
     return None

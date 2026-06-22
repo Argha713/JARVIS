@@ -47,6 +47,16 @@ class Narration:
         if count:
             logger.debug("[NARRATION] Flushed {} stale item(s)", count)
 
+    async def wait_until_idle(self, buffer_sec: float = 0.5) -> None:
+        """
+        Wait until all queued narration has finished speaking, then pause buffer_sec.
+        Call this before recording mic input so JARVIS's own voice isn't captured.
+        """
+        await asyncio.sleep(0)   # yield once so any pending say() puts land in queue
+        await self.queue.join()  # blocks until current speech + queue are fully done
+        if buffer_sec > 0:
+            await asyncio.sleep(buffer_sec)
+
     async def worker(self) -> None:
         """Long-running coroutine. Drains queue and speaks each message in order."""
         while True:

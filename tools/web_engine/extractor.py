@@ -235,6 +235,12 @@ def extract_page(page: Page, site_id: str, page_id: str, url: str) -> list[dict]
         meaningful.append(item)
         section_id = store.upsert_section(page_id, label, selector)
         store.index_section(section_id, label, value, site_id, page_id, url)
+        # Cache the value immediately so queries can answer from SQLite without a
+        # Playwright round-trip.  This is especially important when multiple sections
+        # share the same CSS selector (e.g. all stat cards → div.statistic_card):
+        # the JS extractor resolves each card's value individually while query_selector()
+        # would return only the first match.  Caching here preserves all correct values.
+        store.set_cache(section_id, value)
         logger.debug("[EXTRACTOR] Indexed  {} label={!r} value={!r}",
                      section_id[:8], label[:40], value[:40])
 

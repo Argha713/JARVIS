@@ -116,6 +116,21 @@ async def cancel_active_launch() -> None:
 async def _launch_and_wait(browser: str, profile: str | None, config: dict, timeout: int) -> bool:
     global _active_proc
 
+    # If the browser is already open, Popen with --load-extension is silently ignored
+    # because Chrome hands off to the existing process. Skip Popen entirely and just
+    # wait for the extension to connect — it must be permanently installed for this to work.
+    if browser_detector.is_running(browser):
+        logger.warning(
+            "[Launcher] {} is already running — skipping Popen (--load-extension would be "
+            "ignored). Waiting {}s for extension to connect. "
+            "If it never connects, install the extension permanently via chrome://extensions "
+            "→ Developer mode → Load unpacked → select the 'extension/' folder.",
+            browser, timeout,
+        )
+        connected = await _wait_for_connection(timeout)
+        logger.info("[Launcher] _wait_for_connection (existing instance) → connected={}", connected)
+        return connected
+
     exe = browser_detector.find_exe(browser)
     if not exe:
         logger.error("[Launcher] Executable not found for browser={!r}", browser)
