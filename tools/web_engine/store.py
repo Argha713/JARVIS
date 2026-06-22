@@ -237,6 +237,26 @@ def init_db() -> None:
             is_seed  INTEGER NOT NULL DEFAULT 0,
             added_at TEXT    NOT NULL DEFAULT (datetime('now'))
         );
+
+        CREATE TABLE IF NOT EXISTS site_profiles (
+            site_id   TEXT PRIMARY KEY,
+            browser   TEXT NOT NULL,
+            profile   TEXT NOT NULL,
+            last_used TEXT DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS installed_profiles (
+            browser         TEXT NOT NULL,
+            profile         TEXT NOT NULL,
+            installed_at    TEXT DEFAULT (datetime('now')),
+            last_connected  TEXT,
+            PRIMARY KEY (browser, profile)
+        );
+
+        CREATE TABLE IF NOT EXISTS browser_prefs (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
         """)
     # Migrate existing DB: add request_body column if the table was created before this field
     try:
@@ -852,3 +872,93 @@ def get_hallucinations() -> set:
     with _db() as con:
         rows = con.execute("SELECT phrase FROM whisper_hallucinations").fetchall()
     return {r["phrase"] for r in rows}
+
+
+# ─────────────────────────────────────────────
+# Browser integration
+# ─────────────────────────────────────────────
+
+def get_site_profile(site_id: str) -> dict | None:
+    """Return the saved browser+profile for a site, or None if not known."""
+    with _db() as con:
+        row = con.execute(
+            "SELECT browser, profile FROM site_profiles WHERE site_id=?", (site_id,)
+        ).fetchone()
+    if row:
+        logger.debug("[STORE] get_site_profile {!r} → browser={!r} profile={!r}", site_id, row["browser"], row["profile"])
+        return {"browser": row["browser"], "profile": row["profile"]}
+    logger.debug("[STORE] get_site_profile {!r} → None (not saved)", site_id)
+    return None
+
+
+def save_site_profile(site_id: str, browser: str, profile: str) -> None:
+    """Upsert the browser+profile used for a site."""
+    logger.info("[STORE] save_site_profile site={!r} browser={!r} profile={!r}", site_id, browser, profile)
+    with _db() as con:
+        con.execute(
+            "INSERT OR REPLACE INTO site_profiles(site_id, browser, profile, last_used) "
+            "VALUES(?, ?, ?, datetime('now'))",
+            (site_id, browser, profile),
+        )
+
+
+def is_profile_installed(browser: str, profile: str) -> bool:
+    """Return True if this browser+profile has previously had the extension installed."""
+    with _db() as con:
+        row = con.execute(
+            "SELECT 1 FROM installed_profiles WHERE browser=? AND profile=?", (browser, profile)
+        ).fetchone()
+    result = row is not None
+    logger.debug("[STORE] is_profile_installed browser={!r} profile={!r} → {}", browser, profile, result)
+    return result
+
+
+def mark_profile_installed(browser: str, profile: str) -> None:
+    """Record that the extension was installed in this browser+profile."""
+    logger.info("[STORE] mark_profile_installed browser={!r} profile={!r}", browser, profile)
+    with _db() as con:
+        con.execute(
+            "INSERT OR IGNORE INTO installed_profiles(browser, profile) VALUES(?, ?)",
+            (browser, profile),
+        )
+
+
+def mark_profile_connected(browser: str, profile: str) -> None:
+    """Update last_connected timestamp for this browser+profile."""
+    logger.debug("[STORE] mark_profile_connected browser={!r} profile={!r}", browser, profile)
+    with _db() as con:
+        con.execute(
+            "UPDATE installed_profiles SET last_connected=datetime('now') WHERE browser=? AND profile=?",
+            (browser, profile),
+        )
+
+
+def get_last_connected_profile(browser: str) -> str | None:
+    """Return the most recently connected profile for a browser, or None."""
+    with _db() as con:
+        row = con.execute(
+            "SELECT profile FROM installed_profiles WHERE browser=? "
+            "ORDER BY last_connected DESC LIMIT 1",
+            (browser,),
+        ).fetchone()
+    profile = row["profile"] if row else None
+    logger.debug("[STORE] get_last_connected_profile browser={!r} → {!r}", browser, profile)
+    return profile
+
+
+def get_browser_pref(key: str) -> str | None:
+    """Read a generic browser preference value."""
+    with _db() as con:
+        row = con.execute("SELECT value FROM browser_prefs WHERE key=?", (key,)).fetchone()
+    value = row["value"] if row else None
+    logger.debug("[STORE] get_browser_pref {!r} → {!r}", key, value)
+    return value
+
+
+def set_browser_pref(key: str, value: str) -> None:
+    """Write a generic browser preference value."""
+    logger.info("[STORE] set_browser_pref {!r} = {!r}", key, value)
+    with _db() as con:
+        con.execute(
+            "INSERT OR REPLACE INTO browser_prefs(key, value) VALUES(?, ?)", (key, value)
+        )

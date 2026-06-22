@@ -14,7 +14,7 @@ from core import personality
 from memory.chroma_store import ChromaStore
 from tools.registry import ToolRegistry
 from tools.web_engine import store
-from tools.browser_extension import start as start_browser_extension
+from tools.browser_extension import start as start_browser_extension, register_io
 
 
 # Whisper hallucination phrases — populated from DB at boot via personality.boot()
@@ -64,9 +64,11 @@ async def main():
     llm = LLMEngine(config)
     memory = ChromaStore()
     tool_registry = ToolRegistry(memory, narration, config)
-    recorder = CommandRecorder(config)
-    transcriber = Transcriber(config)
     router = TaskRouter(llm, narration, tool_registry)
+
+    recorder    = CommandRecorder(config)
+    transcriber = Transcriber(config)
+    register_io(recorder, transcriber)
 
     wake_queue: asyncio.Queue = asyncio.Queue()
     wake_listener = WakeWordListener(loop, wake_queue, config)

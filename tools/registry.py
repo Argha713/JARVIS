@@ -45,29 +45,46 @@ class _BrowserExtensionTool:
         return f"I don't know how to do {action!r} via the browser extension yet."
 
     def _search(self, query: str) -> str:
-        from tools.browser_extension import connection_manager, run_command_sync
+        from tools.browser_extension import connection_manager, run_command_sync, ensure_browser_connected_sync
 
+        logger.info("[BrowserExtTool] _search: query={!r} connected={}", query[:60], connection_manager.is_connected())
+
+        # ── If not connected: attempt browser setup ───────────────────────────
         if not connection_manager.is_connected():
-            return self._fallback_web_search(query)
+            logger.info("[BrowserExtTool] Extension not connected — attempting browser setup")
+            # site_id for a generic search is empty (any profile will do)
+            connected = ensure_browser_connected_sync("", self._narration)
+            logger.info("[BrowserExtTool] Browser setup result: connected={}", connected)
+            if not connected:
+                logger.info("[BrowserExtTool] Browser setup failed — using DuckDuckGo fallback")
+                return self._fallback_web_search(query)
 
+        # ── Extension is connected — send search_google command ───────────────
         try:
             result_count = self._config.get("browser_extension", {}).get("search_result_count", 5)
+            logger.debug("[BrowserExtTool] Sending search_google: query={!r} result_count={}", query[:60], result_count)
             resp = run_command_sync("search_google", {"query": query, "result_count": result_count})
             data = resp.get("data", {})
+            status = resp.get("status")
+            logger.info("[BrowserExtTool] search_google response: status={!r} data_keys={}", status, list(data.keys()))
 
             kp      = data.get("knowledge_panel", "")
             results = data.get("results", [])
 
             if kp:
+                logger.info("[BrowserExtTool] Returning knowledge panel (len={})", len(kp))
                 return kp
 
             if results:
+                logger.info("[BrowserExtTool] Returning {} result snippets", len(results))
                 lines = [f"{r['title']}: {r['snippet']}" for r in results if r.get("snippet")]
                 return "\n".join(lines[:3])
 
+            logger.warning("[BrowserExtTool] search_google returned no knowledge_panel or results")
             return "I searched but couldn't find a clear answer."
+
         except Exception as exc:
-            logger.warning("[BrowserExtTool] Search failed ({}), using fallback", exc)
+            logger.warning("[BrowserExtTool] search_google failed ({}) — using DuckDuckGo fallback", exc)
             return self._fallback_web_search(query)
 
     def _fallback_web_search(self, query: str) -> str:
