@@ -23,12 +23,21 @@ def ensure_session(site_id: str, narration) -> bool:
     Falls back to the Playwright login flow when the extension is unavailable.
     Returns True if session is ready, False if login timed out.
     """
+    logger.info("[LOGIN] ensure_session: site={!r}", site_id)
+
     from tools.browser_extension import connection_manager
-    if connection_manager.is_connected():
-        logger.debug("[LOGIN] Extension connected — skipping Playwright login for {}", site_id)
+    ext_connected = connection_manager.is_connected()
+    logger.info("[LOGIN] extension connected: {}", ext_connected)
+
+    if ext_connected:
+        logger.info("[LOGIN] Extension path — user's real browser is authenticated, no Playwright login needed")
         return True
 
+    logger.info("[LOGIN] Extension not connected — checking saved Playwright session")
     session = store.load_session(site_id)
+    has_session = session is not None
+    logger.info("[LOGIN] saved session found: {}", has_session)
+
     if session:
         logger.debug("[LOGIN] Session for {} is valid", site_id)
         return True

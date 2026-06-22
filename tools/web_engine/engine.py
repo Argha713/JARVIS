@@ -27,8 +27,8 @@ class WebEngine:
     def __init__(self, narration, config: dict):
         self.narration   = narration
         self._site_svc   = SiteService()
-        self._pending_query: tuple[str, str] | None = None   # (query, site_id) for background check
-        self._last_page_url: dict[str, str] = {}             # site_id → last discovered page URL
+        self._pending_query: tuple[str, str] | None = None
+        self._last_page_url: dict[str, str] = {}
 
         store.init_db()
         threading.Thread(target=validator.run_if_due, daemon=True).start()
@@ -38,58 +38,92 @@ class WebEngine:
 
     def run(self, params: dict) -> str:
         recorder = params.get("_recorder")
+        action   = params.get("action")
 
-        if params.get("action") == "confirm_pending":
+        logger.info("[ENGINE] ══════════════════════════════════════")
+        logger.info("[ENGINE] run() called: action={!r} recorder={}", action, recorder is not None)
+
+        # ── Confirm pending ───────────────────────────────────────────────
+        if action == "confirm_pending":
+            logger.info("[ENGINE] Branch: confirm_pending")
             return self._handle_confirm_pending()
 
         query = params.get("text", "").strip()
+        logger.info("[ENGINE] query={!r}", query)
+
         if not query:
+            logger.warning("[ENGINE] Empty query — returning early")
             return "I didn't catch what you wanted to find. Could you say that again?"
 
-        logger.info("[ENGINE] Query: {!r}", query)
-
-        # ── Special action dispatch ────────────────────────────────────────
-        action = params.get("action")
+        # ── Special action dispatch ───────────────────────────────────────
+        logger.debug("[ENGINE] Checking special actions: action={!r}", action)
         if action == "teach_tag":
+            logger.info("[ENGINE] Branch: teach_tag")
             return self._site_svc.handle_teach_tag(query)
         if action == "refresh_knowledge":
+            logger.info("[ENGINE] Branch: refresh_knowledge")
             return self._handle_refresh_knowledge()
         if action == "teach_site":
+            logger.info("[ENGINE] Branch: teach_site")
             return self._site_svc.handle_teach_site(query)
         if action == "add_aliases":
+            logger.info("[ENGINE] Branch: add_aliases")
             return self._site_svc.handle_add_aliases(query, lambda q: self.run({"text": q}))
 
-        # ── Resolve site ─────────────────────────────────────────────────
+        # ── Resolve site ──────────────────────────────────────────────────
+        logger.debug("[ENGINE] Resolving site from query …")
         site_id, intent = resolver.resolve(query)
         site_id_hint    = params.get("site_id")
+
+        logger.info("[ENGINE] resolver.resolve → site_id={!r} intent={!r}", site_id, intent)
+
         if site_id is None and site_id_hint:
             site_id, intent = site_id_hint, "read"
-            logger.info("[ENGINE] Using caller-provided site_id hint: {}", site_id)
+            logger.info("[ENGINE] site_id was None — using caller hint: site_id={!r}", site_id)
 
         if site_id is None:
+            logger.info("[ENGINE] site_id still None — asking user for URL (site_svc.ask_for_site)")
+            logger.info("[ENGINE] SiteService state: awaiting_site_url={} awaiting_aliases={}",
+                        self._site_svc.awaiting_site_url, self._site_svc.awaiting_aliases)
             return self._site_svc.ask_for_site(query)
 
-        # ── Write intent ─────────────────────────────────────────────────
+        logger.info("[ENGINE] site_id resolved: {!r}", site_id)
+
+        # ── Write intent ──────────────────────────────────────────────────
         if intent == "write":
+            logger.info("[ENGINE] Branch: WRITE intent → _handle_write")
             return self._handle_write(site_id, query, recorder)
 
-        # ── Read intent → delegate to query_router ────────────────────────
+        # ── Read intent ───────────────────────────────────────────────────
+        logger.info("[ENGINE] Branch: READ intent → query_router.route")
+        logger.debug("[ENGINE] last_page_url cache: {}", self._last_page_url)
         self.narration.step("Let me look that up...")
+
         answer, page_url = query_router.route(
             query, site_id, self.narration, self._last_page_url, recorder
         )
+        logger.info("[ENGINE] query_router returned: answer={} page_url={!r}",
+                    f"len={len(answer)}" if answer and answer != query_router.PORTAL_TIMEOUT else repr(answer),
+                    page_url)
 
         if page_url:
+            logger.debug("[ENGINE] Caching page_url for site {!r}: {!r}", site_id, page_url)
             self._last_page_url[site_id] = page_url
 
         if answer == query_router.PORTAL_TIMEOUT:
             self._pending_query = (query, site_id)
-            logger.info("[ENGINE] Portal timeout — asking user for background check")
+            logger.info("[ENGINE] Portal timeout — storing pending query and asking user")
             return (
                 f"{_PASSTHROUGH}The portal seems slow right now. "
                 "Want me to keep checking and let you know when I find it, sir?"
             )
 
+        if answer:
+            logger.info("[ENGINE] Returning answer (len={}): {!r}", len(answer), answer[:80])
+        else:
+            logger.warning("[ENGINE] No answer from any path — returning fallback message")
+
+        logger.info("[ENGINE] ══════════════════════════════════════")
         return answer or (
             "I couldn't find that data on the portal. "
             "If you tell me which page it's on, I can look there directly."
@@ -98,32 +132,47 @@ class WebEngine:
     # ── Write handler ─────────────────────────────────────────────────────
 
     def _handle_write(self, site_id: str, query: str, recorder=None) -> str:
+        logger.debug("[ENGINE] _handle_write: site={!r} query={!r}", site_id, query[:60])
         eod_text = intent_service.extract_eod_text(query)
+
         if eod_text:
+            logger.info("[ENGINE] Write sub-intent: EOD — eod_text={!r}", eod_text[:60])
             self.narration.step("Opening work journal...")
-            return form_submit.run(site_id, "form_submit_eod", {"text": eod_text}, recorder=recorder)
+            result = form_submit.run(site_id, "form_submit_eod", {"text": eod_text}, recorder=recorder)
+            logger.info("[ENGINE] form_submit.run returned: {!r}", result[:80])
+            logger.info("[ENGINE] ══════════════════════════════════════")
+            return result
+
+        logger.info("[ENGINE] Write sub-intent: GENERIC — opening browser for user interaction")
         site = store.get_site(site_id)
+        logger.debug("[ENGINE] site record: {}", site)
         if site:
             self.narration.step(f"Opening {site['name'] or site_id} for you...")
+        logger.info("[ENGINE] ══════════════════════════════════════")
         return "Please complete this action in the browser that's opening now."
 
     # ── Misc handlers ─────────────────────────────────────────────────────
 
     def _handle_confirm_pending(self) -> str:
+        logger.debug("[ENGINE] _handle_confirm_pending: pending_query={}", self._pending_query)
         if self._pending_query:
             q, s = self._pending_query
             store.add_pending_query(q, s)
             self._pending_query = None
-            logger.info("[ENGINE] Pending query saved: {!r}", q)
+            logger.info("[ENGINE] Pending query saved: site={!r} query={!r}", s, q)
+            logger.info("[ENGINE] ══════════════════════════════════════")
             return (
                 f"{_PASSTHROUGH}I've made a note of it. I'll keep an eye on the portal "
                 "and let you know as soon as I find it, sir."
             )
+        logger.info("[ENGINE] No pending query to confirm")
+        logger.info("[ENGINE] ══════════════════════════════════════")
         return f"{_PASSTHROUGH}There's no pending query saved, sir."
 
     def _handle_refresh_knowledge(self) -> str:
+        logger.info("[ENGINE] Manual knowledge refresh triggered — starting validator thread")
         threading.Thread(target=validator.run_full, args=(self.narration,), daemon=True).start()
-        logger.info("[ENGINE] Manual knowledge refresh triggered")
+        logger.info("[ENGINE] ══════════════════════════════════════")
         return f"{_PASSTHROUGH}I'll update everything in the background, sir."
 
     # ── Public helpers (backward-compatible with task_router) ─────────────

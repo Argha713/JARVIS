@@ -18,7 +18,7 @@ Available tools:
   copy:    {"action":"copy","src":"<src>","dst":"<dst>"}
   move:    {"action":"move","src":"<src>","dst":"<dst>"}
 
-- web_search: search the internet for current information, news, weather, prices
+- browser_extension: search Google or interact with the web via the user's real browser
   search:  {"action":"search","query":"<search query>"}
 
 - browser: open a specific URL and read its contents
@@ -36,8 +36,8 @@ Answer directly: {"tool":"answer"}
 Examples:
 "find my resume" → {"tool":"file_ops","params":{"action":"search","query":"resume"}}
 "what is the leadmacro project" → {"tool":"file_ops","params":{"action":"explore","query":"leadmacro"}}
-"what is the weather in Kolkata" → {"tool":"web_search","params":{"action":"search","query":"weather in Kolkata"}}
-"latest news about AI" → {"tool":"web_search","params":{"action":"search","query":"latest AI news"}}
+"what is the weather in Kolkata" → {"tool":"browser_extension","params":{"action":"search","query":"weather in Kolkata"}}
+"latest news about AI" → {"tool":"browser_extension","params":{"action":"search","query":"latest AI news"}}
 "open bbc.com and tell me the top story" → {"tool":"browser","params":{"action":"read","url":"https://www.bbc.com"}}
 "what is my attendance this month" → {"tool":"web","params":{"action":"query","text":"what is my attendance this month"}}
 "how many casual leaves do I have left" → {"tool":"web","params":{"action":"query","text":"how many casual leaves do I have left"}}
@@ -46,7 +46,7 @@ Examples:
 "what is the capital of France" → {"tool":"answer"}
 "from which website did you get that" → {"tool":"answer"}"""
 
-KNOWN_TOOLS = {"file_ops", "web_search", "browser", "web", "answer"}
+KNOWN_TOOLS = {"file_ops", "browser_extension", "browser", "web", "answer"}
 _KEYWORDS_PATH = "data/style_keywords.json"
 
 

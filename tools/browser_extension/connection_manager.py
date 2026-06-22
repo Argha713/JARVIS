@@ -70,31 +70,41 @@ class ConnectionManager:
     def _route(self, data: dict):
         # Heartbeat pong
         if data.get("status") == "pong":
+            logger.debug("[ConnMgr] Received PONG")
             if self._pong_received:
                 self._pong_received.set()
             return
 
         # Response to a dispatched command (has correlation id)
         if "id" in data:
+            id_short = data["id"][:8]
+            status   = data.get("status", "?")
+            logger.debug("[ConnMgr] Routing RESPONSE: id={} status={!r} → message_handler", id_short, status)
             if self._message_handler:
                 self._message_handler(data)
+            else:
+                logger.warning("[ConnMgr] No message_handler set — response dropped for id={}", id_short)
             return
 
         # Unsolicited push event from extension
         if "event" in data:
             event = data["event"]
+            logger.info("[ConnMgr] Received PUSH EVENT: {!r} data={}", event, {k: v for k, v in data.items() if k != "event"})
             if event == "connected":
                 self._last_profile = {
                     "profile_dir": data.get("profile_dir", ""),
                     "profile_name": data.get("profile_name", ""),
                 }
-                logger.info(f"[BrowserExtension] Profile: {self._last_profile}")
+                logger.info("[ConnMgr] Profile info: {}", self._last_profile)
             handler = self._event_handlers.get(event)
             if handler:
+                logger.debug("[ConnMgr] Dispatching event {!r} to registered handler", event)
                 handler(data)
+            else:
+                logger.debug("[ConnMgr] No handler registered for event {!r}", event)
             return
 
-        logger.debug(f"[BrowserExtension] Unrouted message: {data}")
+        logger.warning("[ConnMgr] Unrouted message (no id, no event, not pong): {}", data)
 
     async def _heartbeat_loop(self):
         while True:
