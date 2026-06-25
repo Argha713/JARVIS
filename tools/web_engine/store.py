@@ -8,6 +8,7 @@ Embedding model selection (reads config.json at startup):
 """
 import json
 import sqlite3
+import threading
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -27,6 +28,7 @@ _COLLECTION  = "portal_sections"
 
 _embedding_fn = None   # None = not yet resolved
 _embedding_fn_ready = False
+_embedding_fn_lock = threading.Lock()
 
 
 def _get_embedding_fn():
@@ -37,39 +39,43 @@ def _get_embedding_fn():
     Result is cached after first call.
     """
     global _embedding_fn, _embedding_fn_ready
+    # Double-checked lock: fast path for the common (already-initialised) case.
     if _embedding_fn_ready:
         return _embedding_fn
+    with _embedding_fn_lock:
+        if _embedding_fn_ready:
+            return _embedding_fn
 
-    try:
-        cfg = json.loads(Path("config.json").read_text(encoding="utf-8"))
-        provider = cfg.get("llm", {}).get("provider", "ollama")
-        logger.info("[STORE] LLM provider={!r} → selecting ChromaDB embedding model", provider)
+        try:
+            cfg = json.loads(Path("config.json").read_text(encoding="utf-8"))
+            provider = cfg.get("llm", {}).get("provider", "ollama")
+            logger.info("[STORE] LLM provider={!r} → selecting ChromaDB embedding model", provider)
 
-        if provider == "openai":
-            api_key = cfg.get("llm", {}).get("openai_api_key", "")
-            if api_key:
-                from chromadb.utils.embedding_functions import OpenAIEmbeddingFunction
-                _embedding_fn = OpenAIEmbeddingFunction(
-                    api_key=api_key,
-                    model_name="text-embedding-3-small",
-                )
-                logger.info("[STORE] ChromaDB embedding: OpenAI text-embedding-3-small "
-                            "(1536 dims, ~$0.02/M tokens)")
+            if provider == "openai":
+                api_key = cfg.get("llm", {}).get("openai_api_key", "")
+                if api_key:
+                    from chromadb.utils.embedding_functions import OpenAIEmbeddingFunction
+                    _embedding_fn = OpenAIEmbeddingFunction(
+                        api_key=api_key,
+                        model_name="text-embedding-3-small",
+                    )
+                    logger.info("[STORE] ChromaDB embedding: OpenAI text-embedding-3-small "
+                                "(1536 dims, ~$0.02/M tokens)")
+                else:
+                    logger.warning("[STORE] provider=openai but no API key found — "
+                                   "falling back to local MiniLM")
+                    _embedding_fn = None
             else:
-                logger.warning("[STORE] provider=openai but no API key found — "
-                               "falling back to local MiniLM")
-                _embedding_fn = None
-        else:
-            logger.info("[STORE] ChromaDB embedding: local all-MiniLM-L6-v2 (384 dims, free)")
-            _embedding_fn = None   # None = ChromaDB default (MiniLM)
+                logger.info("[STORE] ChromaDB embedding: local all-MiniLM-L6-v2 (384 dims, free)")
+                _embedding_fn = None   # None = ChromaDB default (MiniLM)
 
-    except Exception as e:
-        logger.warning("[STORE] Could not read config.json for embedding selection ({})"
-                       " — using MiniLM default", e)
-        _embedding_fn = None
+        except Exception as e:
+            logger.warning("[STORE] Could not read config.json for embedding selection ({})"
+                           " — using MiniLM default", e)
+            _embedding_fn = None
 
-    _embedding_fn_ready = True
-    return _embedding_fn
+        _embedding_fn_ready = True
+        return _embedding_fn
 
 CACHE_TTL_HOURS = 24
 
@@ -257,29 +263,81 @@ def init_db() -> None:
             key   TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );
+
+        -- ── JARVIS system state ─────────────────────────────────────────────
+
+        CREATE TABLE IF NOT EXISTS system_info (
+            key        TEXT PRIMARY KEY,
+            value      TEXT,
+            updated_at TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS browser_state (
+            browser              TEXT NOT NULL,
+            profile              TEXT NOT NULL,
+            display_name         TEXT,
+            exe_path             TEXT,
+            is_installed         INTEGER DEFAULT 1,
+            extension_installed  INTEGER DEFAULT 0,
+            is_active            INTEGER DEFAULT 0,
+            detected_at          TEXT,
+            PRIMARY KEY (browser, profile)
+        );
+
+        -- Single-row table (id is always 1) for live extension connection state.
+        CREATE TABLE IF NOT EXISTS extension_state (
+            id              INTEGER PRIMARY KEY CHECK (id = 1),
+            is_connected    INTEGER DEFAULT 0,
+            active_browser  TEXT,
+            active_profile  TEXT,
+            connected_at    TEXT,
+            disconnected_at TEXT
+        );
+        INSERT OR IGNORE INTO extension_state (id, is_connected) VALUES (1, 0);
+
+        CREATE TABLE IF NOT EXISTS site_health (
+            site_id             TEXT PRIMARY KEY REFERENCES sites(id) ON DELETE CASCADE,
+            session_status      TEXT DEFAULT 'unknown',
+            last_refresh_at     TEXT,
+            last_section_count  INTEGER DEFAULT 0,
+            last_checked_at     TEXT
+        );
         """)
-    # Migrate existing DB: add request_body column if the table was created before this field
+
+    # ── Column migrations (idempotent — ignored if column already exists) ──────
+    _migrate("ALTER TABLE api_endpoints ADD COLUMN request_body TEXT",
+             "api_endpoints: added request_body")
+    _migrate("ALTER TABLE pages ADD COLUMN settle_ms INTEGER DEFAULT NULL",
+             "pages: added settle_ms")
+    _migrate("ALTER TABLE sites ADD COLUMN refresh_interval_minutes INTEGER DEFAULT 60",
+             "sites: added refresh_interval_minutes")
+
+    logger.debug("[STORE] DB initialised at {}", _DB_PATH)
+
+
+def _migrate(sql: str, label: str) -> None:
     try:
         with _db() as con:
-            con.execute("ALTER TABLE api_endpoints ADD COLUMN request_body TEXT")
-        logger.debug("[STORE] Migrated api_endpoints: added request_body column")
-    except Exception:
-        pass  # Column already exists — normal on fresh start after schema update
-    logger.debug("[STORE] DB initialised at {}", _DB_PATH)
+            con.execute(sql)
+        logger.debug("[STORE] Migration applied — {}", label)
+    except sqlite3.OperationalError as e:
+        if "duplicate column" not in str(e).lower():
+            logger.error("[STORE] Migration error for {!r}: {}", label, e)
+            raise
 
 
 # ─────────────────────────────────────────────
 # Sites
 # ─────────────────────────────────────────────
 
-def upsert_site(site_id: str, base_url: str, name: str = "") -> None:
+def upsert_site(site_id: str, base_url: str, name: Optional[str] = None) -> None:
     with _db() as con:
         con.execute("""
             INSERT INTO sites (id, base_url, name)
             VALUES (?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 base_url = excluded.base_url,
-                name     = COALESCE(excluded.name, sites.name)
+                name     = COALESCE(NULLIF(excluded.name, ''), sites.name)
         """, (site_id, base_url, name))
 
 
@@ -765,6 +823,8 @@ def _human_time(iso: str) -> str:
     dt = datetime.fromisoformat(iso).astimezone()
     now = datetime.now(dt.tzinfo)
     delta = now - dt
+    if delta.total_seconds() < 0:
+        return "just now"
     if delta.days == 0:
         return "earlier today"
     if delta.days == 1:
@@ -815,7 +875,6 @@ def seed_personality_phrase(category: str, phrase: str) -> None:
             "INSERT OR IGNORE INTO personality_phrases (category, phrase, is_seed) VALUES (?,?,1)",
             (category, phrase),
         )
-    with _db() as con:
         con.execute(
             "INSERT OR IGNORE INTO personality_refresh (category) VALUES (?)", (category,)
         )
@@ -962,3 +1021,231 @@ def set_browser_pref(key: str, value: str) -> None:
         con.execute(
             "INSERT OR REPLACE INTO browser_prefs(key, value) VALUES(?, ?)", (key, value)
         )
+
+
+# ─────────────────────────────────────────────
+# System info
+# ─────────────────────────────────────────────
+
+def system_info_set(key: str, value: str) -> None:
+    with _db() as con:
+        con.execute(
+            "INSERT OR REPLACE INTO system_info(key, value, updated_at) VALUES(?,?,?)",
+            (key, value, _now()),
+        )
+
+
+def system_info_get(key: str) -> str | None:
+    with _db() as con:
+        row = con.execute("SELECT value FROM system_info WHERE key=?", (key,)).fetchone()
+    return row["value"] if row else None
+
+
+def system_info_set_all(platform: str, version: str, hostname: str) -> None:
+    """Write OS/machine info in one call."""
+    now = _now()
+    with _db() as con:
+        for k, v in (("os_platform", platform), ("os_version", version), ("hostname", hostname)):
+            con.execute(
+                "INSERT OR REPLACE INTO system_info(key, value, updated_at) VALUES(?,?,?)",
+                (k, v, now),
+            )
+    logger.info("[STORE] system_info saved: platform={!r} version={!r} hostname={!r}",
+                platform, version, hostname)
+
+
+# ─────────────────────────────────────────────
+# Browser state
+# ─────────────────────────────────────────────
+
+def browser_state_upsert(
+    browser: str,
+    profile: str,
+    display_name: str = "",
+    exe_path: str = "",
+    is_installed: bool = True,
+    extension_installed: bool = False,
+    is_active: bool = False,
+) -> None:
+    with _db() as con:
+        con.execute("""
+            INSERT INTO browser_state
+                (browser, profile, display_name, exe_path,
+                 is_installed, extension_installed, is_active, detected_at)
+            VALUES (?,?,?,?,?,?,?,?)
+            ON CONFLICT(browser, profile) DO UPDATE SET
+                display_name        = excluded.display_name,
+                exe_path            = excluded.exe_path,
+                is_installed        = excluded.is_installed,
+                is_active           = excluded.is_active,
+                detected_at         = excluded.detected_at
+        """, (browser, profile, display_name, exe_path,
+              int(is_installed), int(extension_installed), int(is_active), _now()))
+
+
+def browser_state_set_extension_installed(browser: str, profile: str, installed: bool) -> None:
+    """Mark whether the JARVIS extension is installed in this browser+profile."""
+    with _db() as con:
+        con.execute(
+            "INSERT INTO browser_state(browser, profile, extension_installed, detected_at) "
+            "VALUES(?,?,?,?) "
+            "ON CONFLICT(browser, profile) DO UPDATE SET extension_installed=excluded.extension_installed",
+            (browser, profile, int(installed), _now()),
+        )
+    logger.info("[STORE] browser_state extension_installed={} for {}:{}", installed, browser, profile)
+
+
+def browser_state_set_active(browser: str, profile: str) -> None:
+    """Mark a browser+profile as the active one (clears is_active on all others)."""
+    with _db() as con:
+        con.execute("UPDATE browser_state SET is_active=0")
+        con.execute(
+            "INSERT INTO browser_state(browser, profile, is_active, detected_at) "
+            "VALUES(?,?,1,?) "
+            "ON CONFLICT(browser, profile) DO UPDATE SET is_active=1",
+            (browser, profile, _now()),
+        )
+
+
+def browser_state_get(browser: str, profile: str) -> dict | None:
+    with _db() as con:
+        row = con.execute(
+            "SELECT * FROM browser_state WHERE browser=? AND profile=?", (browser, profile)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def browser_state_get_active() -> dict | None:
+    """Return the currently active browser+profile row, or None."""
+    with _db() as con:
+        row = con.execute(
+            "SELECT * FROM browser_state WHERE is_active=1 LIMIT 1"
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def extension_installed_any() -> bool:
+    """Return True if ANY browser+profile has the JARVIS extension installed."""
+    with _db() as con:
+        row = con.execute(
+            "SELECT 1 FROM browser_state WHERE extension_installed=1 LIMIT 1"
+        ).fetchone()
+    return row is not None
+
+
+# ─────────────────────────────────────────────
+# Extension connection state
+# ─────────────────────────────────────────────
+
+def extension_state_set_connected(browser: str, profile: str) -> None:
+    """Record that the extension just connected."""
+    with _db() as con:
+        con.execute("""
+            UPDATE extension_state
+            SET is_connected=1, active_browser=?, active_profile=?,
+                connected_at=?, disconnected_at=NULL
+            WHERE id=1
+        """, (browser, profile, _now()))
+    logger.info("[STORE] extension_state → connected ({}:{})", browser, profile)
+
+
+def extension_state_set_disconnected() -> None:
+    """Record that the extension disconnected."""
+    with _db() as con:
+        con.execute("""
+            UPDATE extension_state
+            SET is_connected=0, disconnected_at=?
+            WHERE id=1
+        """, (_now(),))
+    logger.info("[STORE] extension_state → disconnected")
+
+
+def extension_state_get() -> dict | None:
+    with _db() as con:
+        row = con.execute("SELECT * FROM extension_state WHERE id=1").fetchone()
+    return dict(row) if row else None
+
+
+# ─────────────────────────────────────────────
+# Site health
+# ─────────────────────────────────────────────
+
+def site_health_upsert(
+    site_id: str,
+    session_status: str,
+    last_section_count: int = 0,
+) -> None:
+    now = _now()
+    with _db() as con:
+        con.execute("""
+            INSERT INTO site_health(site_id, session_status, last_refresh_at,
+                                    last_section_count, last_checked_at)
+            VALUES(?,?,?,?,?)
+            ON CONFLICT(site_id) DO UPDATE SET
+                session_status     = excluded.session_status,
+                last_refresh_at    = CASE WHEN excluded.last_section_count > 0
+                                          THEN excluded.last_refresh_at
+                                          ELSE site_health.last_refresh_at END,
+                last_section_count = excluded.last_section_count,
+                last_checked_at    = excluded.last_checked_at
+        """, (site_id, session_status, now, last_section_count, now))
+    logger.debug("[STORE] site_health {} → status={!r} sections={}", site_id, session_status, last_section_count)
+
+
+def site_health_get(site_id: str) -> dict | None:
+    with _db() as con:
+        row = con.execute("SELECT * FROM site_health WHERE site_id=?", (site_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def site_health_get_all() -> dict[str, dict]:
+    """Returns {site_id: health_dict} for all sites that have health records."""
+    with _db() as con:
+        rows = con.execute("SELECT * FROM site_health").fetchall()
+    return {r["site_id"]: dict(r) for r in rows}
+
+
+# ─────────────────────────────────────────────
+# Page scheduling helpers
+# ─────────────────────────────────────────────
+
+def save_page_settle_ms(page_id: str, ms: int) -> None:
+    """Persist the learned React render settle time for a page."""
+    with _db() as con:
+        con.execute("UPDATE pages SET settle_ms=? WHERE id=?", (ms, page_id))
+    logger.debug("[STORE] page {} settle_ms={}", page_id[:8], ms)
+
+
+def get_pages_for_refresh() -> list[dict]:
+    """
+    Return all pages joined with their site's refresh_interval_minutes and settle_ms.
+    Used by bg_refresher to build the per-page schedule.
+    """
+    with _db() as con:
+        rows = con.execute("""
+            SELECT p.id, p.site_id, p.url, p.name,
+                   p.settle_ms, p.last_validated_at,
+                   COALESCE(s.refresh_interval_minutes, 60) AS refresh_interval_minutes
+            FROM pages p
+            JOIN sites s ON p.site_id = s.id
+            ORDER BY p.site_id, p.url
+        """).fetchall()
+    return [dict(r) for r in rows]
+
+
+def invalidate_site_cache(site_id: str) -> None:
+    """
+    Delete all SQLite cache values for every section on every page of site_id.
+    ChromaDB embeddings (labels) are left intact so JARVIS still knows what sections exist.
+    Called by bg_refresher when session expiry is detected (0 sections returned).
+    """
+    with _db() as con:
+        con.execute("""
+            DELETE FROM cache
+            WHERE section_id IN (
+                SELECT s.id FROM sections s
+                JOIN pages p ON s.page_id = p.id
+                WHERE p.site_id = ?
+            )
+        """, (site_id,))
+    logger.warning("[STORE] invalidate_site_cache {} — all cached values deleted", site_id)

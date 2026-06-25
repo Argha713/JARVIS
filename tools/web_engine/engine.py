@@ -31,7 +31,21 @@ class WebEngine:
         self._last_page_url: dict[str, str] = {}
 
         store.init_db()
-        threading.Thread(target=validator.run_if_due, daemon=True).start()
+
+        # Skip Playwright validator if the extension was ever installed — bg_refresher
+        # takes over cache freshness when Chrome opens.  New users (no extension set up)
+        # still get the Playwright validator as before.
+        #
+        # Boot-ordering note: extension_installed_any() reads the DB, not the live
+        # WebSocket state.  The WS handshake hasn't happened yet at this point, so
+        # we can't rely on connection_manager.is_connected().  A returning user who
+        # has the extension installed but hasn't opened Chrome yet will still skip
+        # the validator — bg_refresher will refresh once the extension connects.
+        if store.extension_installed_any():
+            logger.info("[ENGINE] Extension previously installed — skipping Playwright validator")
+        else:
+            threading.Thread(target=validator.run_if_due, daemon=True).start()
+
         portal_seeder.seed(config)
 
     # ── Main entry (called by registry) ──────────────────────────────────

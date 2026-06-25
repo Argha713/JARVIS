@@ -4,11 +4,18 @@ and returns all meaningful data sections as [{label, value, selector}].
 Also stores them in SQLite + ChromaDB.
 """
 import re
+import threading
 
 from loguru import logger
 from playwright.sync_api import Page
 
 from tools.web_engine import store
+
+# H3 FIX: bg_refresher (event-loop thread) and query_router (thread-pool worker)
+# can call persist_sections() concurrently for the same page.  The read-modify-
+# delete sequence (get existing sections → compute stale → delete stale) is not
+# atomic across SQLite connections, so we serialise all callers here.
+_persist_lock = threading.Lock()
 
 
 def _is_meaningful_label(label: str) -> bool:
@@ -179,7 +186,7 @@ def extract_page(page: Page, site_id: str, page_id: str, url: str) -> list[dict]
     """
     Run the full-page extractor on a loaded Playwright page.
     Returns list of {label, value, selector}.
-    Also persists everything to SQLite + ChromaDB.
+    Also persists everything to SQLite + ChromaDB via persist_sections().
     """
     logger.info("[EXTRACTOR] Extracting: {} (site={})", url, site_id)
     try:
@@ -189,7 +196,6 @@ def extract_page(page: Page, site_id: str, page_id: str, url: str) -> list[dict]
         return []
 
     if not raw:
-        # Diagnostic: dump a sample of visible page text so we can debug selectors
         try:
             sample = page.evaluate(
                 "() => document.body.innerText.trim().replace(/\\s+/g,' ').slice(0, 500)"
@@ -200,6 +206,24 @@ def extract_page(page: Page, site_id: str, page_id: str, url: str) -> list[dict]
             pass
         return []
 
+    return persist_sections(raw, site_id, page_id, url)
+
+
+def persist_sections(raw: list[dict], site_id: str, page_id: str, url: str) -> list[dict]:
+    """
+    Persist raw [{label, value, selector}] from any source (Playwright or extension)
+    to SQLite + ChromaDB.  Returns meaningful sections only (noise filtered out).
+
+    Called by:
+      - extract_page()        — Playwright path
+      - bg_refresher          — extension path (background tab extraction)
+    """
+    with _persist_lock:
+        return _persist_sections_locked(raw, site_id, page_id, url)
+
+
+def _persist_sections_locked(raw: list[dict], site_id: str, page_id: str, url: str) -> list[dict]:
+    """Inner implementation — must only be called while _persist_lock is held."""
     # Deduplicate by label (keep first occurrence)
     seen_labels: set = set()
     sections = []
@@ -212,7 +236,6 @@ def extract_page(page: Page, site_id: str, page_id: str, url: str) -> list[dict]
 
     logger.info("[EXTRACTOR] {} sections found on: {}", len(sections), url)
 
-    # Log every extracted section so we can see exactly what was picked up
     for i, item in enumerate(sections):
         logger.debug(
             "[EXTRACTOR] #{:02d} label={!r:<45} value={!r}",
@@ -235,11 +258,9 @@ def extract_page(page: Page, site_id: str, page_id: str, url: str) -> list[dict]
         meaningful.append(item)
         section_id = store.upsert_section(page_id, label, selector)
         store.index_section(section_id, label, value, site_id, page_id, url)
-        # Cache the value immediately so queries can answer from SQLite without a
-        # Playwright round-trip.  This is especially important when multiple sections
-        # share the same CSS selector (e.g. all stat cards → div.statistic_card):
-        # the JS extractor resolves each card's value individually while query_selector()
-        # would return only the first match.  Caching here preserves all correct values.
+        # Cache immediately — multiple sections may share the same CSS selector
+        # (e.g. all stat cards → div.statistic_card).  The JS extractor resolves
+        # each card individually; query_selector() would return only the first.
         store.set_cache(section_id, value)
         logger.debug("[EXTRACTOR] Indexed  {} label={!r} value={!r}",
                      section_id[:8], label[:40], value[:40])
@@ -247,8 +268,6 @@ def extract_page(page: Page, site_id: str, page_id: str, url: str) -> list[dict]
     noise_count = len(sections) - len(meaningful)
 
     # Purge stale entries from BOTH ChromaDB and SQLite.
-    # SQLite accumulates rows across sessions; deleting them here keeps the DB clean
-    # and avoids stale labels interfering with future runs.
     existing = store.get_sections_for_page(page_id)
     stale_ids: list[str] = []
     for sec in existing:
@@ -264,7 +283,7 @@ def extract_page(page: Page, site_id: str, page_id: str, url: str) -> list[dict]
         "[EXTRACTOR] Done — {} indexed ({} noise filtered), {} stale purged (ChromaDB + SQLite)",
         len(meaningful), noise_count, len(stale_ids),
     )
-    return meaningful  # callers only see meaningful sections — no noise cached
+    return meaningful
 
 
 def refresh_section(page: Page, section_id: str, selector: str, label: str) -> str | None:

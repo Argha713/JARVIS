@@ -15,6 +15,7 @@ from memory.chroma_store import ChromaStore
 from tools.registry import ToolRegistry
 from tools.web_engine import store
 from tools.browser_extension import start as start_browser_extension, register_io
+from tools.browser_extension import bg_refresher
 
 
 # Whisper hallucination phrases — populated from DB at boot via personality.boot()
@@ -57,7 +58,7 @@ async def main():
 
     logger.add("logs/jarvis.log", rotation="10 MB", retention="7 days")
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     tts = VoiceOutput(config)
     narration = Narration(tts, loop)   # loop required for thread-safe narration from tool threads
@@ -181,6 +182,7 @@ async def main():
             keyboard_trigger(),
             personality.refresh_loop(llm, config),
             start_browser_extension(config),
+            bg_refresher.run(config),
         )
     except (KeyboardInterrupt, asyncio.CancelledError):
         pass

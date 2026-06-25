@@ -41,6 +41,7 @@ async function dispatch(command, params) {
         case 'search_google':   return cmdSearchGoogle(params);
         case 'extract_section': return cmdExtractSection(params);
         case 'get_api_data':    return cmdGetApiData(params);
+        case 'extract_page':    return cmdExtractPage(params);
         default:
             throw new Error(`Unknown command: ${command}`);
     }
@@ -290,6 +291,81 @@ async function waitForTabLoad(tabId, timeoutMs = 15_000) {
     });
 }
 
+// ── extract_page — background tab extraction ────────────────────────────
+//
+// Opens a hidden tab, waits for the page to load + React to render, runs the
+// _jarvis.extractPage() extractor, then closes the tab.
+//
+// Two modes:
+//   settle_ms = null  → polling mode (first visit): poll every poll_interval_ms
+//                       until sections appear or poll_max_ms elapses.
+//                       Returns { sections, learned_ms } where learned_ms = elapsed + 1000.
+//   settle_ms = N     → fixed-wait mode (subsequent visits): wait N ms once, extract.
+//                       Returns { sections, learned_ms: null }.
+//
+// KEEP IN SYNC with tools/web_engine/extractor.py (_JS constant) and
+// extension/content/page_extractor.js.
+
+async function cmdExtractPage({
+    url,
+    settle_ms = null,
+    poll_interval_ms = 500,
+    poll_max_ms = 15_000,
+}) {
+    if (!url) throw new Error('extract_page: url is required');
+
+    const tab = await chrome.tabs.create({ url, active: false });
+    // H7 FIX: persist the tab ID so the next SW startup can close it if the
+    // SW is killed before the finally block runs.
+    await chrome.storage.session.set({ _jarvis_bg_tab_id: tab.id });
+
+    try {
+        await waitForTabLoad(tab.id);
+        await injectOnce(tab.id, 'content/page_extractor.js');
+
+        // H8 FIX: an inactive tab has visibilityState='hidden', which causes Ant Design
+        // and other lazy-rendering portals to defer stat card rendering entirely.
+        // Briefly make the tab active so the page sees a visibility change and renders,
+        // then restore the user's previously active tab immediately after.
+        const [prevActive] = await chrome.tabs.query({ active: true, currentWindow: true });
+        await chrome.tabs.update(tab.id, { active: true });
+        await new Promise(r => setTimeout(r, 150));
+        if (prevActive) await chrome.tabs.update(prevActive.id, { active: true }).catch(() => {});
+
+        if (settle_ms !== null) {
+            // Known settle time — wait once, extract once
+            await new Promise(r => setTimeout(r, settle_ms));
+            const [{ result }] = await chrome.scripting.executeScript({
+                target: { tabId: tab.id },
+                // H-LOW FIX: null-guard in case of SPA navigation since injection
+                func: () => window._jarvis && window._jarvis.extractPage ? window._jarvis.extractPage() : null,
+            });
+            return { sections: result || [], learned_ms: null };
+        }
+
+        // Polling mode — first visit, unknown render time
+        const start = Date.now();
+        const deadline = start + poll_max_ms;
+        while (Date.now() < deadline) {
+            await new Promise(r => setTimeout(r, poll_interval_ms));
+            const [{ result }] = await chrome.scripting.executeScript({
+                target: { tabId: tab.id },
+                func: () => window._jarvis && window._jarvis.extractPage ? window._jarvis.extractPage() : null,
+            });
+            if (result && result.length > 0) {
+                const elapsed = Date.now() - start;
+                return { sections: result, learned_ms: elapsed + 1000 };
+            }
+        }
+        // Timed out — page not accessible or session expired
+        return { sections: [], learned_ms: null };
+
+    } finally {
+        chrome.tabs.remove(tab.id).catch(() => {});
+        chrome.storage.session.remove('_jarvis_bg_tab_id').catch(() => {});
+    }
+}
+
 // ── Keep-alive alarm ────────────────────────────────────────────────────
 
 chrome.alarms.create('keepalive', { periodInMinutes: 0.4 });
@@ -300,5 +376,19 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 });
 
 // ── Boot ────────────────────────────────────────────────────────────────
+
+// H7 FIX: If the service worker was killed mid-cmdExtractPage, the background
+// tab was never closed (the finally block doesn't run in a terminated SW).
+// On each SW startup, close any such orphaned tab recorded in session storage.
+(async () => {
+    try {
+        const { _jarvis_bg_tab_id } = await chrome.storage.session.get('_jarvis_bg_tab_id');
+        if (_jarvis_bg_tab_id) {
+            await chrome.tabs.remove(_jarvis_bg_tab_id).catch(() => {});
+            await chrome.storage.session.remove('_jarvis_bg_tab_id');
+            console.log('[JARVIS] Closed orphaned background tab', _jarvis_bg_tab_id);
+        }
+    } catch (e) {}
+})();
 
 connect();

@@ -9,8 +9,12 @@ class CommandDispatcher:
 
     def __init__(self, manager: ConnectionManager):
         self._cm = manager
+        # _pending is only mutated from the asyncio event loop (dispatch() is a
+        # coroutine, _on_response / _cancel_all_pending are called from it).
+        # Never touch this dict from a worker thread.
         self._pending: dict[str, asyncio.Future] = {}
         manager.set_message_handler(self._on_response)
+        manager.set_reconnect_handler(self._cancel_all_pending)
 
     async def dispatch(self, command: str, params: dict = None, timeout: int = None) -> dict:
         """Send a command to the extension and await its response."""
@@ -73,3 +77,16 @@ class CommandDispatcher:
 
         logger.debug("[Dispatcher] Resolving future id={}", id_short)
         future.set_result(data)
+
+    def _cancel_all_pending(self, exc: Exception) -> None:
+        """Reject all in-flight Futures when the extension reconnects (SW restart).
+        Called from the event loop via ConnectionManager's reconnect hook so that
+        callers learn immediately instead of waiting 30-90s for a timeout."""
+        if not self._pending:
+            return
+        count = len(self._pending)
+        for future in list(self._pending.values()):
+            if not future.done():
+                future.set_exception(exc)
+        self._pending.clear()
+        logger.info("[Dispatcher] Cancelled {} pending future(s) on reconnect: {}", count, exc)

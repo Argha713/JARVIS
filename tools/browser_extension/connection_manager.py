@@ -2,6 +2,8 @@ import asyncio
 import json
 from loguru import logger
 
+from tools.web_engine import store
+
 
 class ConnectionManager:
     _HEARTBEAT_TIMEOUT = 5  # seconds to wait for pong before dropping
@@ -9,6 +11,7 @@ class ConnectionManager:
     def __init__(self):
         self._ws = None
         self._message_handler = None
+        self._reconnect_handler = None
         self._event_handlers: dict = {}
         self._last_profile: dict | None = None
         self._heartbeat_interval: int = 20
@@ -28,6 +31,11 @@ class ConnectionManager:
     def set_message_handler(self, handler):
         """Called by CommandDispatcher to register the response callback."""
         self._message_handler = handler
+
+    def set_reconnect_handler(self, handler):
+        """Called by CommandDispatcher to be notified on every extension reconnect.
+        handler(exc) is invoked from the event loop with a ConnectionResetError."""
+        self._reconnect_handler = handler
 
     def on_event(self, event_name: str, handler):
         """Register a handler for unsolicited push events from the extension."""
@@ -56,6 +64,11 @@ class ConnectionManager:
             self._ws = None
             self._pong_received = None
             logger.info("[BrowserExtension] Extension disconnected.")
+            # Update DB + clear in-memory flag
+            try:
+                store.extension_state_set_disconnected()
+            except Exception as exc:
+                logger.debug("[BrowserExtension] extension_state_set_disconnected error: {}", exc)
 
     # ── Private ────────────────────────────────────────────────────────────
 
@@ -63,11 +76,11 @@ class ConnectionManager:
         async for raw in websocket:
             try:
                 data = json.loads(raw)
-                self._route(data)
+                await self._route(data)
             except json.JSONDecodeError:
                 logger.warning(f"[BrowserExtension] Non-JSON message ignored: {raw!r}")
 
-    def _route(self, data: dict):
+    async def _route(self, data: dict):
         # Heartbeat pong
         if data.get("status") == "pong":
             logger.debug("[ConnMgr] Received PONG")
@@ -91,11 +104,44 @@ class ConnectionManager:
             event = data["event"]
             logger.info("[ConnMgr] Received PUSH EVENT: {!r} data={}", event, {k: v for k, v in data.items() if k != "event"})
             if event == "connected":
+                profile_dir  = data.get("profile_dir", "Default")
+                profile_name = data.get("profile_name", "Default")
                 self._last_profile = {
-                    "profile_dir": data.get("profile_dir", ""),
-                    "profile_name": data.get("profile_name", ""),
+                    "profile_dir":  profile_dir,
+                    "profile_name": profile_name,
                 }
                 logger.info("[ConnMgr] Profile info: {}", self._last_profile)
+
+                # Reject any in-flight commands from the previous WS connection.
+                # SW restart closes the old WS, so their Futures will never resolve
+                # otherwise — callers would wait the full 30-90s timeout.
+                if self._reconnect_handler:
+                    try:
+                        self._reconnect_handler(ConnectionResetError("Extension reconnected"))
+                    except Exception as exc:
+                        logger.debug("[ConnMgr] reconnect_handler error (ignored): {}", exc)
+
+                # Persist to DB off the event loop so WebSocket reads aren't blocked.
+                loop = asyncio.get_running_loop()
+                try:
+                    # Infer browser from stored site_profiles or default to "chrome"
+                    active  = await loop.run_in_executor(None, store.browser_state_get_active)
+                    browser = active["browser"] if active else "chrome"
+                    profile = profile_dir or "Default"
+
+                    await loop.run_in_executor(None, store.extension_state_set_connected, browser, profile)
+                    await loop.run_in_executor(None, store.browser_state_set_extension_installed, browser, profile, True)
+                    await loop.run_in_executor(None, store.browser_state_set_active, browser, profile)
+                except Exception as exc:
+                    logger.debug("[ConnMgr] State DB update error (ignored): {}", exc)
+
+                # Signal bg_refresher to run immediately
+                try:
+                    from tools.browser_extension import bg_refresher
+                    bg_refresher.signal_refresh_now()
+                except Exception as exc:
+                    logger.debug("[ConnMgr] bg_refresher signal error (ignored): {}", exc)
+
             handler = self._event_handlers.get(event)
             if handler:
                 logger.debug("[ConnMgr] Dispatching event {!r} to registered handler", event)
