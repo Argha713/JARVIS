@@ -80,6 +80,14 @@ async def run(config: dict) -> None:
     # Boot delay: let WebSocket server start and extension connect
     await asyncio.sleep(30)
 
+    # If the extension has never been installed there are no background tabs to open.
+    # Idle cheaply until the user sets up the extension (checked every 5 min).
+    if not store.extension_installed_any():
+        logger.info("[BG_REFRESH] Extension never installed — idling (checking every 5 min)")
+        while not store.extension_installed_any():
+            await asyncio.sleep(300)
+        logger.info("[BG_REFRESH] Extension now installed — starting refresh loop")
+
     while True:
         pages = store.get_pages_for_refresh()
 
@@ -225,6 +233,7 @@ async def _handle_empty(site_id: str, page_id: str, url: str) -> None:
     )
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, store.invalidate_site_cache, site_id)
+    await loop.run_in_executor(None, store.clear_session, site_id)
     await loop.run_in_executor(
         None, lambda: store.site_health_upsert(site_id, "expired", last_section_count=0)
     )

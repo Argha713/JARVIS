@@ -24,6 +24,15 @@ def seed(config: dict) -> None:
     if not store.get_site(PORTAL_SITE_ID):
         store.upsert_site(PORTAL_SITE_ID, _PORTAL_BASE, "Simplified HR Portal")
 
+    # Ensure the three portal pages exist so bg_refresher can schedule them and
+    # query_router can look them up on first visit (before any Playwright run).
+    for page_name, path in [
+        ("activity", "/my-activity"),
+        ("leave",    "/leave"),
+        ("requests", "/requests"),
+    ]:
+        store.upsert_page(PORTAL_SITE_ID, _PORTAL_BASE + path, page_name)
+
     for tag in _PORTAL_TAGS:
         store.add_tag(PORTAL_SITE_ID, tag)
 

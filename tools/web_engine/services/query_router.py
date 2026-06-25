@@ -217,6 +217,7 @@ def _try_extension_extract_page(
                 "marking session expired", site_id
             )
             store.invalidate_site_cache(site_id)
+            store.clear_session(site_id)
             store.site_health_upsert(site_id, "expired", last_section_count=0)
             # Update the in-memory cache in bg_refresher so the next query sees it immediately.
             # H4 FIX: use the public setter (thread-safe, lock-guarded) rather than

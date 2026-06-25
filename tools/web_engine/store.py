@@ -369,6 +369,18 @@ def save_session(site_id: str, session_data: dict) -> None:
     logger.debug("[STORE] Session saved for {}", site_id)
 
 
+def clear_session(site_id: str) -> None:
+    """Erase stored Playwright session cookies for a site.
+    Call when a session expiry is detected so Playwright doesn't waste time
+    replaying stale cookies on the next discovery attempt."""
+    with _db() as con:
+        con.execute(
+            "UPDATE sites SET session_data=NULL, session_expires_at=NULL WHERE id=?",
+            (site_id,),
+        )
+    logger.debug("[STORE] Session cleared for {}", site_id)
+
+
 def load_session(site_id: str) -> Optional[dict]:
     with _db() as con:
         row = con.execute(
