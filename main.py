@@ -175,6 +175,20 @@ async def main():
 
             wake_listener.start()
 
+    # ── DEV ONLY: wait 60s, open Chrome + load extension, then trigger discovery ─
+    async def _dev_auto_discover():
+        from tools.browser_extension.browser_launcher import open_browser
+        from tools.web_engine.discovery_engine import discover
+        logger.info("[DEV] Waiting 60s before auto-discovery...")
+        await asyncio.sleep(60)
+        logger.info("[DEV] Opening Chrome for auto-discovery...")
+        connected = await open_browser("chrome", None, config, narration=narration)
+        if not connected:
+            logger.warning("[DEV] Browser/extension did not connect — skipping auto-discovery")
+            return
+        logger.info("[DEV] Extension connected — starting discovery for https://people.codeclouds.com")
+        await discover("https://people.codeclouds.com", narration, config)
+
     try:
         await asyncio.gather(
             narration.worker(),
@@ -183,6 +197,7 @@ async def main():
             personality.refresh_loop(llm, config),
             start_browser_extension(config),
             bg_refresher.run(config),
+            _dev_auto_discover(),
         )
     except (KeyboardInterrupt, asyncio.CancelledError):
         pass

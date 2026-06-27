@@ -19,16 +19,9 @@ from loguru import logger
 
 from tools.web_engine import store, api_client, discoverer
 from tools.web_engine.extractor import persist_sections
-from tools.web_engine.services import cache_service, intent_service, portal_seeder
+from tools.web_engine.services import cache_service, intent_service
 
 _PORTAL_TIMEOUT = "__PORTAL_TIMEOUT__"
-
-# URL mapping: page_name → path suffix (relative to site base_url)
-_PAGE_PATHS: dict[str, str] = {
-    "activity": "/my-activity",
-    "leave":    "/leave",
-    "requests": "/requests",
-}
 
 
 def route(
@@ -51,18 +44,19 @@ def route(
     logger.info("[QueryRouter] needs_fresh={}", needs_fresh)
 
     # ── Step 1: API-first ─────────────────────────────────────────────────
-    page_name = portal_seeder.query_to_page_name(site_id, query)
-    logger.info("[QueryRouter] Step 1 — API-first: page_name={!r}", page_name)
+    page_row = store.find_page_for_query(site_id, query)
+    logger.info("[QueryRouter] Step 1 — API-first: page_row={!r}",
+                page_row["name"] if page_row else None)
 
-    if page_name:
-        answer = _try_api(site_id, page_name, query, narration)
+    if page_row:
+        answer = _try_api(site_id, page_row["name"], query, narration)
         if answer is not None:
             logger.info("[QueryRouter] Step 1 RESOLVED via API")
             logger.info("[QueryRouter] ══════════════════════════════════════════")
             return answer, None
         logger.info("[QueryRouter] Step 1 MISS")
     else:
-        logger.info("[QueryRouter] Step 1 SKIP — no page_name mapping")
+        logger.info("[QueryRouter] Step 1 SKIP — no page_tag mapping for query")
 
     # ── Step 2: ChromaDB cache ────────────────────────────────────────────
     logger.info("[QueryRouter] Step 2 — cache: needs_fresh={}", needs_fresh)
@@ -99,7 +93,7 @@ def route(
             ext_connected = False
 
     if ext_connected:
-        answer = _try_extension_extract_page(query, site_id, page_name, narration)
+        answer = _try_extension_extract_page(query, site_id, page_row, narration)
         if answer:
             logger.info("[QueryRouter] Step 3 RESOLVED via extension extract_page")
             logger.info("[QueryRouter] ══════════════════════════════════════════")
@@ -157,35 +151,21 @@ def _try_api(site_id: str, page_name: str, query: str, narration) -> str | None:
 def _try_extension_extract_page(
     query: str,
     site_id: str,
-    page_name: str | None,
+    page_row,
     narration,
 ) -> str | None:
     """
     Open a background tab via the extension, extract all sections, persist to cache,
     then answer from the newly populated cache.
-
-    Replaces the old navigate → extract_section approach:
-      OLD: navigated the user's active tab, extracted one section, didn't update cache
-      NEW: opens an invisible background tab, extracts all sections, caches all values
     """
     from tools.browser_extension import run_command_sync
 
-    site = store.get_site(site_id)
-    if not site:
-        logger.debug("[QueryRouter._try_ext_extract] site not found: {!r}", site_id)
+    if not page_row:
+        logger.debug("[QueryRouter._try_ext_extract] no page_row for query — cannot extract")
         return None
 
-    target_page = page_name or portal_seeder.query_to_page_name(site_id, query)
-    if not target_page:
-        logger.debug("[QueryRouter._try_ext_extract] no page mapping for query — cannot extract")
-        return None
-
-    base_url = site["base_url"].rstrip("/")
-    path     = _PAGE_PATHS.get(target_page, f"/{target_page}")
-    url      = base_url + path
-
-    page_row  = store.get_page_by_url(site_id, url)
-    settle_ms = page_row["settle_ms"] if page_row and page_row["settle_ms"] else None
+    url       = page_row["url"]
+    settle_ms = page_row["settle_ms"] if page_row["settle_ms"] else None
 
     logger.info("[QueryRouter._try_ext_extract] extract_page url={!r} settle_ms={}", url, settle_ms)
 
@@ -230,13 +210,7 @@ def _try_extension_extract_page(
         return None
 
     # Sections found — persist and update state
-    if not page_row:
-        # First visit: the page hasn't been registered yet. Upsert it now so we
-        # have a page_id to associate sections with.
-        page_id = store.upsert_page(site_id, url)
-        logger.info("[QueryRouter._try_ext_extract] created page_row on first visit: {!r}", url)
-    else:
-        page_id = page_row["id"]
+    page_id = page_row["id"]
 
     meaningful = persist_sections(sections, site_id, page_id, url)
     store.mark_page_validated(page_id)

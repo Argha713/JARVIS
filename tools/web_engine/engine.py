@@ -2,10 +2,10 @@
 WebEngine: thin orchestrator. Called by tools/registry.py.
 
 Delegates to:
-  services/query_router.py  — read-path decision chain
-  services/site_service.py  — site teaching / alias state machine
+  services/query_router.py   — read-path decision chain
+  services/site_service.py   — site teaching / alias state machine
   services/intent_service.py — EOD / write-sub-intent detection
-  services/portal_seeder.py  — site seeding on startup
+  discovery_engine.py        — user-triggered page discovery ("watch <URL>")
 """
 import threading
 
@@ -15,7 +15,6 @@ from tools.web_engine import store, resolver, validator
 from tools.web_engine.actions import form_submit
 from tools.web_engine.services import (
     intent_service,
-    portal_seeder,
     query_router,
 )
 from tools.web_engine.services.site_service import SiteService
@@ -26,6 +25,7 @@ _PASSTHROUGH = "__PASSTHROUGH__:"
 class WebEngine:
     def __init__(self, narration, config: dict):
         self.narration   = narration
+        self._config     = config
         self._site_svc   = SiteService()
         self._pending_query: tuple[str, str] | None = None
         self._last_page_url: dict[str, str] = {}
@@ -45,8 +45,6 @@ class WebEngine:
             logger.info("[ENGINE] Extension previously installed — skipping Playwright validator")
         else:
             threading.Thread(target=validator.run_if_due, daemon=True).start()
-
-        portal_seeder.seed(config)
 
     # ── Main entry (called by registry) ──────────────────────────────────
 
@@ -71,6 +69,10 @@ class WebEngine:
 
         # ── Special action dispatch ───────────────────────────────────────
         logger.debug("[ENGINE] Checking special actions: action={!r}", action)
+        if action == "discover_site":
+            logger.info("[ENGINE] Branch: discover_site url={!r}", query)
+            return self._handle_discover_site(query)
+
         if action == "teach_tag":
             logger.info("[ENGINE] Branch: teach_tag")
             return self._site_svc.handle_teach_tag(query)
@@ -182,6 +184,22 @@ class WebEngine:
         logger.info("[ENGINE] No pending query to confirm")
         logger.info("[ENGINE] ══════════════════════════════════════")
         return f"{_PASSTHROUGH}There's no pending query saved, sir."
+
+    def _handle_discover_site(self, url: str) -> str:
+        """Fire-and-forget: schedule discovery_engine.discover() on the main loop."""
+        import asyncio
+        from tools.browser_extension import _main_loop
+        from tools.web_engine.discovery_engine import discover
+
+        if not _main_loop or not _main_loop.is_running():
+            return "I can't start discovery right now — the event loop isn't ready, sir."
+
+        asyncio.run_coroutine_threadsafe(
+            discover(url, self.narration, self._config),
+            _main_loop,
+        )
+        logger.info("[ENGINE] Discovery scheduled for {!r}", url)
+        return f"__PASSTHROUGH__Starting discovery for {url}, sir. I'll explore the page and let you know when I'm done."
 
     def _handle_refresh_knowledge(self) -> str:
         logger.info("[ENGINE] Manual knowledge refresh triggered — starting validator thread")

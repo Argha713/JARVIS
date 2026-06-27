@@ -125,6 +125,12 @@ def init_db() -> None:
             PRIMARY KEY (site_id, tag)
         );
 
+        CREATE TABLE IF NOT EXISTS page_tags (
+            page_id TEXT NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+            tag     TEXT NOT NULL,
+            PRIMARY KEY (page_id, tag)
+        );
+
         CREATE TABLE IF NOT EXISTS pages (
             id                  TEXT PRIMARY KEY,
             site_id             TEXT NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
@@ -430,6 +436,67 @@ def all_tags() -> list[tuple[str, str]]:
     with _db() as con:
         rows = con.execute("SELECT site_id, tag FROM site_tags").fetchall()
     return [(r["site_id"], r["tag"]) for r in rows]
+
+
+# ─────────────────────────────────────────────
+# Page tags (page-level routing)
+# ─────────────────────────────────────────────
+
+def add_page_tag(page_id: str, tag: str) -> None:
+    tag = tag.strip().lower()
+    if not tag:
+        return
+    with _db() as con:
+        con.execute(
+            "INSERT OR IGNORE INTO page_tags (page_id, tag) VALUES (?, ?)",
+            (page_id, tag)
+        )
+
+
+def find_page_for_query(site_id: str, query: str) -> Optional[sqlite3.Row]:
+    """Find the page whose tags best match the query.
+    Returns the pages row or None if no page-level tag matches."""
+    with _db() as con:
+        rows = con.execute("""
+            SELECT p.id, p.url, p.name, pt.tag
+            FROM page_tags pt
+            JOIN pages p ON pt.page_id = p.id
+            WHERE p.site_id = ?
+        """, (site_id,)).fetchall()
+
+    if not rows:
+        return None
+
+    query_lower = query.lower()
+
+    # Exact substring match
+    matched_page_id = None
+    for row in rows:
+        if row["tag"] in query_lower:
+            matched_page_id = row["id"]
+            break
+
+    # Fuzzy fallback
+    if not matched_page_id:
+        try:
+            from rapidfuzz import fuzz, process as rfprocess
+            tag_pairs = [(row["tag"], row["id"]) for row in rows]
+            match = rfprocess.extractOne(
+                query_lower,
+                [t for t, _ in tag_pairs],
+                scorer=fuzz.partial_ratio,
+                score_cutoff=75,
+            )
+            if match:
+                matched_page_id = tag_pairs[match[2]][1]
+        except Exception:
+            pass
+
+    if not matched_page_id:
+        return None
+
+    with _db() as con:
+        return con.execute("SELECT * FROM pages WHERE id=?", (matched_page_id,)).fetchone()
 
 
 # ─────────────────────────────────────────────

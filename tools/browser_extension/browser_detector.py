@@ -88,25 +88,57 @@ def is_running(browser: str) -> bool:
     """
     Return True if the REAL browser is running with its normal user data directory.
 
-    Uses the browser's SingletonLock file rather than tasklist. Tasklist would also
-    detect Playwright's bundled Chromium (which shares the chrome.exe binary name on
-    Windows) causing false positives when the validator's headless browser is active.
-    SingletonLock is only written by the real browser instance — Playwright uses an
-    isolated temp user-data-dir and never touches the user's Chrome directory.
+    Primary check: SingletonLock file (fast, no subprocess).
+    Fallback check: scan running processes for the browser exe whose command line
+    references the real user-data-dir.  This catches Chrome 130+ "background mode"
+    which keeps chrome.exe alive after all windows close without creating a lock.
 
-    Edge case: if Chrome crashes without cleanup, the lock file can remain (stale).
-    Chrome itself handles stale locks on next start; for us the worst case is a 10s
-    wait then Playwright fallback, which is acceptable.
+    The process scan filters out Playwright: Playwright uses an isolated temp
+    user-data-dir, so its chrome.exe processes never contain the real UDD path.
+    Child processes (--type=renderer, --type=gpu-process, etc.) are also skipped
+    because they always carry a --type= flag; only the main browser process does not.
     """
     udd = get_user_data_dir(browser)
     if not udd.exists():
         logger.debug("[Detector] is_running {!r} → False (user_data_dir not found)", browser)
         return False
+
+    # Fast path — lock file present
     lock = udd / "SingletonLock"
-    found = lock.exists()
-    logger.debug("[Detector] is_running {!r} → {} (SingletonLock {})",
-                 browser, found, "present" if found else "absent")
-    return found
+    if lock.exists():
+        logger.debug("[Detector] is_running {!r} → True (SingletonLock present)", browser)
+        return True
+
+    # Fallback: process scan (SingletonLock absent in Chrome background mode)
+    _EXE_NAMES: dict[str, str] = {
+        "chrome":  "chrome.exe",
+        "edge":    "msedge.exe",
+        "brave":   "brave.exe",
+        "firefox": "firefox.exe",
+    }
+    exe_name = _EXE_NAMES.get(browser)
+    if exe_name and _SYSTEM == "Windows":
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["wmic", "process", "where", f"name='{exe_name}'", "get", "CommandLine", "/format:list"],
+                capture_output=True, text=True, timeout=5,
+            )
+            udd_lower = str(udd).lower()
+            for line in result.stdout.splitlines():
+                line = line.strip()
+                if not line.startswith("CommandLine="):
+                    continue
+                cmd = line[len("CommandLine="):]
+                # Must reference the real user-data-dir AND be a main process (no --type=)
+                if udd_lower in cmd.lower() and "--type=" not in cmd:
+                    logger.debug("[Detector] is_running {!r} → True (process found, no SingletonLock — background mode)", browser)
+                    return True
+        except Exception as exc:
+            logger.debug("[Detector] process scan failed: {}", exc)
+
+    logger.debug("[Detector] is_running {!r} → False (SingletonLock absent, no matching process)", browser)
+    return False
 
 
 def infer_profile_for_domain(browser: str, domain: str) -> str | None:

@@ -145,3 +145,41 @@ window._jarvis.extractPage = function extractPage() {
 
     return results;
 };
+
+window._jarvis.discoverNavLinks = function discoverNavLinks() {
+    const currentOrigin = window.location.origin;
+    const currentPath   = window.location.pathname;
+    const seen          = new Set();
+    const links         = [];
+
+    // Prefer nav/sidebar/menu areas; fall back to all anchors
+    const navEls = document.querySelectorAll(
+        'nav, [class*="sidebar"], [class*="menu"], [class*="nav-"], [role="navigation"], header'
+    );
+    const pool = navEls.length > 0
+        ? Array.from(navEls).flatMap(el => Array.from(el.querySelectorAll('a[href]')))
+        : Array.from(document.querySelectorAll('a[href]'));
+
+    for (const a of pool) {
+        let href;
+        try { href = new URL(a.href, window.location.href); } catch { continue; }
+
+        if (href.origin !== currentOrigin)  continue;  // external
+        if (href.pathname === currentPath)  continue;  // same page (pagination/filter)
+        if (!href.pathname || href.pathname === '/') continue;
+
+        const text  = (a.innerText || '').replace(/\s+/g, ' ').trim();
+        const label = a.getAttribute('aria-label') || a.getAttribute('title') || '';
+
+        // Skip bare icon-only links (arrow buttons with no readable text)
+        if (!text && !label) continue;
+
+        const normalized = href.origin + href.pathname;
+        if (seen.has(normalized)) continue;
+        seen.add(normalized);
+
+        links.push({ text: text || label, url: href.href, path: href.pathname });
+    }
+
+    return links;
+};

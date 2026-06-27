@@ -32,6 +32,13 @@ _EOD_RE = re.compile(
 
 # Phase 5.5: multi-turn site teaching patterns
 _TAG_TEACH_RE = re.compile(r'\bwhen\s+i\s+say\b', re.IGNORECASE)
+
+# Discovery: "watch <url>", "start watching <url>", "jarvis watch <url>"
+_WATCH_RE = re.compile(
+    r'\b(?:watch|start\s+watching|monitor|track|add\s+page|learn\s+page)\b'
+    r'.{0,30}(https?://\S+|\b[\w.-]+\.(?:com|org|net|io|in|co\.in)\S*)',
+    re.IGNORECASE,
+)
 _REFRESH_RE   = re.compile(
     r'\b(refresh|update|re-?learn|rebuild|sync)\b.{0,25}\b(portal|knowledge|web|site|data)\b'
     r'|\blearn\s+the\s+portal\b|\bupdate\s+portal\s+knowledge\b',
@@ -140,6 +147,13 @@ class TaskRouter:
         conversation so they don't fall through to the 60s LLM router.
         Returns None if no pre-route match (fall through to LLM routing).
         """
+        # Discovery: "watch https://people.codeclouds.com/my-activity"
+        m = _WATCH_RE.search(user_input)
+        if m:
+            url = m.group(1).strip()
+            logger.info("[ROUTER] Watch/discovery command — url={!r}", url)
+            return {"tool": "web", "params": {"action": "discover_site", "text": url}}
+
         # Phase 5.5 — Tag teaching: "when I say paipa, I mean my office portal"
         # Must run BEFORE resolver — query contains portal keywords that would pre-route it
         if _TAG_TEACH_RE.search(user_input):

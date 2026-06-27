@@ -36,11 +36,14 @@ _FORCELIST_KEYS: dict[str, str] = {
 # ── Public async API ───────────────────────────────────────────────────────────
 
 
-async def open_browser(browser: str, profile: str | None, config: dict) -> bool:
+async def open_browser(browser: str, profile: str | None, config: dict, narration=None) -> bool:
     """
-    If the extension is already connected, return True immediately.
-    Otherwise launch the browser with the given profile and wait for the extension.
-    Returns True if connected within the configured timeout.
+    Ensure the browser is open with the JARVIS extension connected.
+
+    - If already connected: return True immediately.
+    - If profile is None: auto-detect the most recently used profile.
+    - If browser is running without the extension: narrate and wait for user
+      to close it (can't inject --load-extension into a running instance).
     """
     logger.info("[Launcher] open_browser: browser={!r} profile={!r}", browser, profile)
 
@@ -48,12 +51,19 @@ async def open_browser(browser: str, profile: str | None, config: dict) -> bool:
         logger.info("[Launcher] Extension already connected — nothing to open")
         return True
 
+    # Auto-detect profile when not specified
+    if profile is None and browser in ("chrome", "edge", "brave", "firefox"):
+        profiles = browser_detector.list_profiles(browser)
+        profile  = profiles[0]["name"] if profiles else None
+        if profile:
+            logger.info("[Launcher] Auto-detected profile: {!r}", profile)
+
     cfg     = config.get("browser_extension", {})
-    timeout = cfg.get("open_timeout_seconds", 15)
-    return await _launch_and_wait(browser, profile, config, timeout)
+    timeout = cfg.get("open_timeout_seconds", 30)
+    return await _launch_and_wait(browser, profile, config, timeout, narration=narration)
 
 
-async def install_and_open_browser(browser: str, profile: str | None, config: dict) -> bool:
+async def install_and_open_browser(browser: str, profile: str | None, config: dict, narration=None) -> bool:
     """
     Write force-install policy for the extension (registry on Windows for Chromium,
     policies.json for Firefox), then launch the browser.
@@ -79,7 +89,7 @@ async def install_and_open_browser(browser: str, profile: str | None, config: di
             "— cannot write force-install policy (manual install required)"
         )
 
-    return await _launch_and_wait(browser, profile, config, timeout)
+    return await _launch_and_wait(browser, profile, config, timeout, narration=narration)
 
 
 async def cancel_active_launch() -> None:
@@ -113,30 +123,53 @@ async def cancel_active_launch() -> None:
 # ── Launch helpers ─────────────────────────────────────────────────────────────
 
 
-async def _launch_and_wait(browser: str, profile: str | None, config: dict, timeout: int) -> bool:
+
+
+async def _launch_and_wait(browser: str, profile: str | None, config: dict, timeout: int, narration=None) -> bool:
     global _active_proc
 
-    # If the browser is already open, Popen with --load-extension is silently ignored
-    # because Chrome hands off to the existing process. Skip Popen entirely and just
-    # wait for the extension to connect — it must be permanently installed for this to work.
     if browser_detector.is_running(browser):
-        logger.warning(
-            "[Launcher] {} is already running — skipping Popen (--load-extension would be "
-            "ignored). Waiting {}s for extension to connect. "
-            "If it never connects, install the extension permanently via chrome://extensions "
-            "→ Developer mode → Load unpacked → select the 'extension/' folder.",
-            browser, timeout,
-        )
-        connected = await _wait_for_connection(timeout)
-        logger.info("[Launcher] _wait_for_connection (existing instance) → connected={}", connected)
-        return connected
+        from tools.web_engine import store
+        if store.extension_installed_any():
+            # Extension was previously set up — browser is already open, just wait
+            # for the service worker to (re)connect.
+            logger.info(
+                "[Launcher] {} already running, extension previously installed — "
+                "waiting {}s for reconnect.", browser, timeout,
+            )
+            connected = await _wait_for_connection(timeout)
+            logger.info("[Launcher] _wait_for_connection (existing instance) → connected={}", connected)
+            return connected
+        else:
+            # Extension has never been installed. Can't inject --load-extension into
+            # a running browser process — ask the user to close it, then relaunch.
+            msg = (
+                f"Sir, {browser.capitalize()} is open but the JARVIS extension isn't loaded. "
+                "Please close it — I'll handle the rest automatically."
+            )
+            logger.info("[Launcher] {} running without extension — waiting for user to close it", browser)
+            if narration:
+                narration.say(msg)
+            else:
+                logger.warning("[Launcher] {}", msg)
+            while browser_detector.is_running(browser):
+                await asyncio.sleep(3)
+            logger.info("[Launcher] {} closed — proceeding with fresh launch", browser)
+            await asyncio.sleep(1)
 
     exe = browser_detector.find_exe(browser)
     if not exe:
         logger.error("[Launcher] Executable not found for browser={!r}", browser)
         return False
 
-    args = _build_args(browser, exe, profile)
+    from tools.web_engine import store
+    first_setup = not store.extension_installed_any()
+
+    # Give the user more time on first setup — they need to see and click the toggle.
+    if first_setup:
+        timeout = max(timeout, 120)
+
+    args = _build_args(browser, exe, profile, first_setup=first_setup)
     logger.info("[Launcher] Launching {} args={}", browser, args)
 
     popen_kwargs: dict = {"close_fds": True}
@@ -153,6 +186,26 @@ async def _launch_and_wait(browser: str, profile: str | None, config: dict, time
         _active_proc = None
         return False
 
+    if first_setup:
+        dev_mode_on = _is_developer_mode_on(browser, profile)
+        if dev_mode_on:
+            msg = (
+                f"Sir, {browser.capitalize()} has opened with the JARVIS extension. "
+                "Connecting now — this will only take a moment."
+            )
+        else:
+            msg = (
+                f"Sir, {browser.capitalize()} has opened. One-time setup required — "
+                "please type chrome colon slash slash extensions in the address bar, "
+                "then enable Developer Mode using the toggle in the top right corner. "
+                "I'll connect automatically as soon as you do."
+            )
+        logger.info("[Launcher] First setup — dev_mode_on={} narrating accordingly", dev_mode_on)
+        if narration:
+            narration.say(msg)
+        else:
+            logger.info("[Launcher] {}", msg)
+
     connected = await _wait_for_connection(timeout)
     logger.info("[Launcher] _wait_for_connection → connected={}", connected)
 
@@ -162,7 +215,7 @@ async def _launch_and_wait(browser: str, profile: str | None, config: dict, time
     return connected
 
 
-def _build_args(browser: str, exe: Path, profile: str | None) -> list[str]:
+def _build_args(browser: str, exe: Path, profile: str | None, *, first_setup: bool = False) -> list[str]:
     args = [str(exe)]
     udd  = browser_detector.get_user_data_dir(browser)
 
@@ -186,6 +239,7 @@ def _build_args(browser: str, exe: Path, profile: str | None) -> list[str]:
             logger.debug("[Launcher] Chromium profile flags: user_data={!r} profile={!r}", str(udd), profile)
         elif not udd.exists():
             logger.debug("[Launcher] Chromium user_data_dir not found ({!r}) — launching default", str(udd))
+
 
     elif browser == "firefox":
         if profile and udd.exists():
@@ -211,6 +265,36 @@ async def _wait_for_connection(timeout: int) -> bool:
         await asyncio.sleep(0.2)
     logger.warning("[Launcher] Extension did not connect within {}s", timeout)
     return False
+
+
+# ── Developer-mode helpers ────────────────────────────────────────────────────
+
+
+def _is_developer_mode_on(browser: str, profile: str | None) -> bool:
+    """
+    Read the Chromium Secure Preferences for the given profile and return
+    whether extensions.ui.developer_mode is True.
+    Returns False on any read/parse error (safe default — triggers narration).
+    """
+    if browser not in ("chrome", "edge", "brave"):
+        return True  # Firefox doesn't use developer mode in the same way
+
+    udd     = browser_detector.get_user_data_dir(browser)
+    profile = profile or "Default"
+    sec_prefs = udd / profile / "Secure Preferences"
+
+    if not sec_prefs.exists():
+        logger.debug("[Launcher] Secure Preferences not found at {!r} — assuming dev mode off", str(sec_prefs))
+        return False
+
+    try:
+        data = json.loads(sec_prefs.read_text(encoding="utf-8", errors="ignore"))
+        on   = data.get("extensions", {}).get("ui", {}).get("developer_mode", False)
+        logger.info("[Launcher] developer_mode in Secure Preferences: {}", on)
+        return bool(on)
+    except Exception as exc:
+        logger.debug("[Launcher] Could not read Secure Preferences: {} — assuming dev mode off", exc)
+        return False
 
 
 # ── Force-install policies ─────────────────────────────────────────────────────

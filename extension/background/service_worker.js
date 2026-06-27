@@ -42,6 +42,7 @@ async function dispatch(command, params) {
         case 'extract_section': return cmdExtractSection(params);
         case 'get_api_data':    return cmdGetApiData(params);
         case 'extract_page':    return cmdExtractPage(params);
+        case 'discover_page':   return cmdDiscoverPage(params);
         default:
             throw new Error(`Unknown command: ${command}`);
     }
@@ -364,6 +365,74 @@ async function cmdExtractPage({
         chrome.tabs.remove(tab.id).catch(() => {});
         chrome.storage.session.remove('_jarvis_bg_tab_id').catch(() => {});
     }
+}
+
+// ── discover_page — foreground tab discovery ────────────────────────────
+//
+// Opens a FOREGROUND tab, waits for render, then extracts sections +
+// nav_links + forms in one shot.  Tab stays open so the user can see it.
+//
+// Same settle_ms / polling logic as cmdExtractPage.
+
+async function cmdDiscoverPage({
+    url,
+    settle_ms      = null,
+    poll_interval_ms = 500,
+    poll_max_ms    = 15_000,
+}) {
+    if (!url) throw new Error('discover_page: url is required');
+
+    const tab = await chrome.tabs.create({ url, active: true });
+    _activeTabId = tab.id;
+    await waitForTabLoad(tab.id);
+
+    await injectOnce(tab.id, 'content/page_extractor.js');
+    await injectOnce(tab.id, 'content/form_reader.js');
+
+    let sections   = [];
+    let learned_ms = null;
+
+    if (settle_ms !== null) {
+        await new Promise(r => setTimeout(r, settle_ms));
+        const [{ result }] = await chrome.scripting.executeScript({
+            target: { tabId: tab.id },
+            func: () => (window._jarvis?.extractPage?.() ?? null),
+        });
+        sections = result || [];
+    } else {
+        const start    = Date.now();
+        const deadline = start + poll_max_ms;
+        while (Date.now() < deadline) {
+            await new Promise(r => setTimeout(r, poll_interval_ms));
+            const [{ result }] = await chrome.scripting.executeScript({
+                target: { tabId: tab.id },
+                func: () => (window._jarvis?.extractPage?.() ?? null),
+            });
+            if (result?.length > 0) {
+                learned_ms = Date.now() - start + 1000;
+                sections   = result;
+                break;
+            }
+        }
+    }
+
+    const [{ result: navLinks }] = await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        func: () => (window._jarvis?.discoverNavLinks?.() ?? []),
+    });
+
+    const [{ result: forms }] = await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        func: () => (window._jarvis?.readForm?.() ?? { fields: [], submits: [] }),
+    });
+
+    // Tab intentionally left open — user should see the discovered page
+    return {
+        sections:   sections  || [],
+        nav_links:  navLinks  || [],
+        forms:      forms     || { fields: [], submits: [] },
+        learned_ms,
+    };
 }
 
 // ── Keep-alive alarm ────────────────────────────────────────────────────
