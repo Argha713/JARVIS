@@ -182,7 +182,7 @@ async def main():
         logger.info("[DEV] Waiting 60s before auto-discovery...")
         await asyncio.sleep(60)
         logger.info("[DEV] Opening Chrome for auto-discovery...")
-        connected = await open_browser("chrome", None, config, narration=narration)
+        connected = await open_browser("chrome", None, config, narration=narration, domain="people.codeclouds.com")
         if not connected:
             logger.warning("[DEV] Browser/extension did not connect — skipping auto-discovery")
             return
